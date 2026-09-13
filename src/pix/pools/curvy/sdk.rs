@@ -65,7 +65,7 @@ use super::{
     CommittedCurvyNote, CurvyNoteSource, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome, Url,
     detect::{bjj_point, scan_public_key_dec},
     indexer,
-    relayer::RelayClient,
+    relayer::{self, RelayClient},
     state::{RedbCurvyDepositState, id_bytes},
 };
 
@@ -152,7 +152,8 @@ pub struct RsSdkCurvyAdapterConfig {
     /// Orthogonal to [`Self::submission`]: this picks *how* a self-submitted transaction reaches
     /// the chain, while `submission` decides whether this node submits at all.
     pub route: Route,
-    /// Fee collector identity required when the configured protocol fee is non-zero.
+    /// The protocol fee collector, required when the aggregator charges a non-zero fee. Unset,
+    /// the collector the gateway publishes at `/protocol` is used under relayed submission.
     pub fee_recipient: Option<Identity>,
     /// How the float is moved into the vault. See [`CurvyShielding`].
     pub shielding: CurvyShielding,
@@ -467,6 +468,25 @@ impl RedbCurvySdkStore {
         write.commit().map_err(db_error)?;
         Ok(())
     }
+}
+
+/// An [`Identity`] from the public keys the gateway spells out: `S`, `V` and the BabyJubJub owner
+/// key, each `"x.y"` decimal — the spelling `Identity` uses for its meta-keys. `who` names the
+/// key in errors.
+fn stealth_identity(keys: &relayer::CurvyPublicKeys, who: &str) -> Result<Identity, RsSdkCurvyAdapterError> {
+    let (x, y) = keys.bjj_public_key.split_once('.').ok_or_else(|| {
+        RsSdkCurvyAdapterError::InvalidValue(format!("{who} {:?} is not an `x.y` point", keys.bjj_public_key))
+    })?;
+    let coordinate = |value: &str, name: &str| {
+        Bn254Fr::try_from_dec(value)
+            .map(Bn254Fr::into_inner)
+            .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("{who} {name}: {error}")))
+    };
+    Ok(Identity {
+        big_k: keys.spend_public_key.clone(),
+        big_v: keys.view_public_key.clone(),
+        bjj_pub: (coordinate(x, "x")?, coordinate(y, "y")?),
+    })
 }
 
 fn relay_error(error: impl std::fmt::Display) -> RsSdkCurvyAdapterError {
@@ -1026,25 +1046,25 @@ where
         let amount = info.required_fee().map_err(|error| {
             RsSdkCurvyAdapterError::InvalidValue(format!("pricing the relayer's fee note: {error}"))
         })?;
-        // `"x.y"`, decimal — the same spelling `Identity` uses for its meta-keys and the relayer
-        // for its operator's owner key.
-        let (x, y) = info.operator.bjj_public_key.split_once('.').ok_or_else(|| {
-            RsSdkCurvyAdapterError::InvalidValue(format!(
-                "the relayer's operator key {:?} is not an `x.y` point",
-                info.operator.bjj_public_key
-            ))
-        })?;
-        let coordinate = |value: &str, name: &str| {
-            Bn254Fr::try_from_dec(value).map(Bn254Fr::into_inner).map_err(|error| {
-                RsSdkCurvyAdapterError::InvalidValue(format!("the relayer's operator key {name}: {error}"))
-            })
-        };
-        let identity = Identity {
-            big_k: info.operator.spend_public_key,
-            big_v: info.operator.view_public_key,
-            bjj_pub: (coordinate(x, "x")?, coordinate(y, "y")?),
-        };
+        let identity = stealth_identity(&info.operator, "the relayer's operator key")?;
         Ok(Some((identity, amount)))
+    }
+
+    /// The protocol fee collector an aggregation's fee note is sealed to: the configured identity,
+    /// else the one the gateway publishes at `/protocol`. `Ok(None)` when neither names one; the
+    /// SDK then builds a fee-free aggregation, or refuses a fee it would have to seal to nobody.
+    async fn fee_recipient(&self) -> Result<Option<Identity>, RsSdkCurvyAdapterError> {
+        if let Some(identity) = &self.config.fee_recipient {
+            return Ok(Some(identity.clone()));
+        }
+        let Some(relay) = self.relay.as_ref() else {
+            return Ok(None);
+        };
+        let info = relay.protocol().await.map_err(relay_error)?;
+        info.fee_collector
+            .as_ref()
+            .map(|keys| stealth_identity(keys, "the protocol fee collector's key"))
+            .transpose()
     }
 
     /// Records an intent before submitting under it, and clears it once the outcome is known.
@@ -1242,13 +1262,14 @@ where
                 }
                 (CurvySubmission::Operator, _) => None,
             };
+            let fee_recipient = self.fee_recipient().await?;
             let aggregated = client
                 .build_pix_aggregation(
                     &self.spender,
                     &funding_notes,
                     &allocations,
                     relay_fee.as_ref().map(|(identity, amount)| (identity, *amount)),
-                    self.config.fee_recipient.as_ref(),
+                    fee_recipient.as_ref(),
                 )
                 .await;
             let aggregated = match aggregated {
@@ -1546,6 +1567,46 @@ mod tests {
     use crate::pix::pools::curvy::{OwnedCurvyDeposit, detect::public_key_from_dec};
 
     type Adapter = RsSdkCurvyAdapter<blokli_client::BlokliClient>;
+
+    #[test]
+    fn the_gateway_fee_collector_becomes_a_sealing_identity() -> anyhow::Result<()> {
+        // Curvy staging's `/protocol` fee collector, whose owner key is the Gnosis aggregator's
+        // `feeNotePublicKey`.
+        let keys = relayer::CurvyPublicKeys {
+            spend_public_key: "98196467739045737361624042364526845165893723256538881225564237194894305749964.85819546747324778252702861357825104568382762224457080263515028979058114370157".to_owned(),
+            view_public_key: "21579150582945393796432405977169743203548565927228117293904839000735742388195.2199873391156304912266865805931783414728595814770346143973990126650821750981".to_owned(),
+            bjj_public_key: "6696655508272513187635510409223451359447854228192370110374659020120287021020.14667705991255323606553352965901746640607929945787383727539340760340072797708".to_owned(),
+        };
+        let identity = stealth_identity(&keys, "the protocol fee collector's key")?;
+        assert_eq!(identity.big_k, keys.spend_public_key);
+        assert_eq!(identity.big_v, keys.view_public_key);
+        assert_eq!(
+            identity.bjj_pub.0,
+            Bn254Fr::try_from_dec("6696655508272513187635510409223451359447854228192370110374659020120287021020")?
+                .into_inner()
+        );
+        assert_eq!(
+            identity.bjj_pub.1,
+            Bn254Fr::try_from_dec("14667705991255323606553352965901746640607929945787383727539340760340072797708")?
+                .into_inner()
+        );
+
+        let error = match stealth_identity(
+            &relayer::CurvyPublicKeys {
+                bjj_public_key: "not-a-point".to_owned(),
+                ..keys
+            },
+            "the protocol fee collector's key",
+        ) {
+            Ok(_) => panic!("a key without a dot is not a point"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("the protocol fee collector's key"),
+            "{error}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn an_intent_id_is_a_v4_uuid() {

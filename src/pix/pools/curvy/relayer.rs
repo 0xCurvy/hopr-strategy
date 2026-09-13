@@ -82,7 +82,7 @@ pub struct RelaySubmission {
 /// rather than guess at it.
 #[derive(Clone, Debug, Deserialize)]
 pub struct PaymasterInfo {
-    pub operator: PaymasterOperator,
+    pub operator: CurvyPublicKeys,
     /// Vault token ids the operator accepts a fee note in; `None` means any.
     #[serde(rename = "acceptedVaultTokenIds")]
     pub accepted_vault_token_ids: Option<Vec<String>>,
@@ -98,8 +98,11 @@ pub struct PaymasterInfo {
     pub relayer_tolerance_bps: u64,
 }
 
+/// The public half of a Curvy stealth identity as the gateway spells it: the `S`/`V` meta keys
+/// and the BabyJubJub owner key, each an `"x.y"` decimal point. The relayer's operator and the
+/// protocol's fee collector are both published in this shape.
 #[derive(Clone, Debug, Deserialize)]
-pub struct PaymasterOperator {
+pub struct CurvyPublicKeys {
     #[serde(rename = "S")]
     pub spend_public_key: String,
     #[serde(rename = "V")]
@@ -129,6 +132,36 @@ impl PaymasterInfo {
             .map(|scaled| scaled / 10_000)
             .ok_or_else(|| StrategyError::other(anyhow::anyhow!("the relayer's buffered gas quote overflows")))?;
         Ok(buffered)
+    }
+}
+
+/// What the gateway publishes about the protocol as a whole at `GET /protocol`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ProtocolInfo {
+    /// The protocol fee collector: one identity shared by every aggregator, the owner of each
+    /// aggregator's `feeNotePublicKey`. `None` when the deployment names no collector, in which
+    /// case only fee-free aggregations can be built.
+    #[serde(rename = "feeCollector")]
+    pub fee_collector: Option<CurvyPublicKeys>,
+}
+
+/// The gateway's `{data, error}` envelope around [`ProtocolInfo`].
+#[derive(Deserialize)]
+struct ProtocolEnvelope {
+    data: Option<ProtocolInfo>,
+    error: Option<serde_json::Value>,
+}
+
+impl ProtocolEnvelope {
+    fn into_info(self) -> Result<ProtocolInfo, RelayError> {
+        self.data.ok_or_else(|| {
+            RelayError::Transport(format!(
+                "the gateway published no protocol data: {}",
+                self.error
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "no error given".to_owned())
+            ))
+        })
     }
 }
 
@@ -195,6 +228,19 @@ impl RelayClient {
             return Ok(None);
         }
         Self::decode(response).await.map(Some)
+    }
+
+    /// The protocol-global facts: the fee collector an aggregation's protocol fee note is sealed
+    /// to.
+    pub async fn protocol(&self) -> Result<ProtocolInfo, RelayError> {
+        let url = self.endpoint("/protocol")?;
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| RelayError::Transport(error.to_string()))?;
+        Self::decode::<ProtocolEnvelope>(response).await?.into_info()
     }
 
     /// Queues a proof for submission.
@@ -349,7 +395,7 @@ mod tests {
 
     fn paymaster(units: &str, price: &str, buffer_bps: u64) -> PaymasterInfo {
         PaymasterInfo {
-            operator: PaymasterOperator {
+            operator: CurvyPublicKeys {
                 spend_public_key: "0x01".to_owned(),
                 view_public_key: "0x02".to_owned(),
                 bjj_public_key: "0x03".to_owned(),
@@ -360,6 +406,48 @@ mod tests {
             client_buffer_bps: buffer_bps,
             relayer_tolerance_bps: 500,
         }
+    }
+
+    /// `GET /protocol` on Curvy staging, 2026-09-13, with the Gnosis aggregator's fee key.
+    const STAGING_PROTOCOL: &str = r#"{"data":{"feeCollector":{"S":"98196467739045737361624042364526845165893723256538881225564237194894305749964.85819546747324778252702861357825104568382762224457080263515028979058114370157","V":"21579150582945393796432405977169743203548565927228117293904839000735742388195.2199873391156304912266865805931783414728595814770346143973990126650821750981","babyJubjubPublicKey":"6696655508272513187635510409223451359447854228192370110374659020120287021020.14667705991255323606553352965901746640607929945787383727539340760340072797708"},"proving":{}},"error":null}"#;
+
+    #[test]
+    fn the_fee_collector_is_read_out_of_the_protocol_envelope() -> anyhow::Result<()> {
+        let info = serde_json::from_str::<ProtocolEnvelope>(STAGING_PROTOCOL)?.into_info()?;
+        let collector = info.fee_collector.expect("staging names a fee collector");
+        assert!(
+            collector
+                .bjj_public_key
+                .starts_with("6696655508272513187635510409223451359447854228192370110374659020120287021020.")
+        );
+        assert!(
+            collector
+                .spend_public_key
+                .starts_with("98196467739045737361624042364526845165893723256538881225564237194894305749964.")
+        );
+        assert!(
+            collector
+                .view_public_key
+                .starts_with("21579150582945393796432405977169743203548565927228117293904839000735742388195.")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_deployment_without_a_fee_collector_is_not_an_error() -> anyhow::Result<()> {
+        let info =
+            serde_json::from_str::<ProtocolEnvelope>(r#"{"data":{"feeCollector":null},"error":null}"#)?.into_info()?;
+        assert!(info.fee_collector.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_protocol_error_envelope_is_reported_with_its_message() -> anyhow::Result<()> {
+        let error = serde_json::from_str::<ProtocolEnvelope>(r#"{"data":null,"error":"protocol not configured"}"#)?
+            .into_info()
+            .expect_err("no data is an error");
+        assert!(error.to_string().contains("protocol not configured"), "{error}");
+        Ok(())
     }
 
     #[test]
