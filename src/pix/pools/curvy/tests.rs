@@ -496,6 +496,8 @@ fn deposit_data_round_trips_through_the_wire_form() -> anyhow::Result<()> {
 #[derive(Default)]
 struct ScriptedIndex {
     pending: parking_lot::Mutex<Vec<CurvyPendingNote>>,
+    /// Committed notes served as candidates, for a source whose pending view missed them.
+    committed_candidates: parking_lot::Mutex<Vec<CurvyPendingNote>>,
     committed: parking_lot::Mutex<Vec<CurvyCommittedNote>>,
     head: parking_lot::Mutex<(u64, u64)>,
     spent_nullifiers: parking_lot::Mutex<HashSet<String>>,
@@ -556,6 +558,21 @@ impl CurvyIndexSource for ScriptedIndex {
             .collect())
     }
 
+    async fn committed_candidates(
+        &self,
+        after: Option<CurvyEventCursor>,
+        first: u32,
+    ) -> Result<Vec<CurvyPendingNote>, String> {
+        let after = after.as_ref().map(cursor_ordinal);
+        Ok(self
+            .committed_candidates
+            .lock()
+            .iter()
+            .filter(|note| after.is_none_or(|after| ordinal(&note.position) > after))
+            .take(first as usize)
+            .cloned()
+            .collect())
+    }
     async fn indexed_head(&self) -> Result<(u64, u64), String> {
         Ok(*self.head.lock())
     }
@@ -768,6 +785,34 @@ async fn pool_round_trip_generate_deposit_notify_and_sweep() -> anyhow::Result<(
     );
     assert!(pool.state().committed_notes(&id)?.is_empty());
     assert!(pool.state().scan_secret(&id)?.is_none());
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn a_note_committed_before_it_was_seen_pending_is_still_discovered() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    let pool = &harness.pool;
+    let id = pix_id(1);
+    let owner = BjjKeypair::random();
+    let address = *owner.public();
+    let data = pool.generate_deposit_data(&id).await?;
+    pool.deposit_funds_to(&id, &address, ten(), data.clone()).await?;
+    // The announcement never reaches the pending view (Curvy's indexer serves finalized
+    // checkpoints, and the batch prover was faster than finality); the committed row is all
+    // the Exit ever sees.
+    let (candidate, note_id) = pending_note_for(data.scan_key(), &address, 10, 4, "11", 5)?;
+    harness.index.committed_candidates.lock().push(candidate);
+    let notification = pool.notify_deposit(id, address, ten())?;
+    harness.index.committed.lock().push(completion(&note_id, 6));
+    *harness.index.head.lock() = (8, 1);
+    let (confirmed_id, confirmed_address, confirmed) = notification.await?;
+    assert_eq!((confirmed_id, confirmed_address, confirmed), (id, address, ten()));
+    assert_eq!(pool.state().committed_amount(&id)?, ten());
+    pool.withdraw_deposit(&id, &owner, Address::from(SAFE), None).await?;
+    assert_eq!(
+        harness.adapter.withdrawals.lock().as_slice(),
+        &[(Address::from(SAFE), 1)]
+    );
     Ok(())
 }
 

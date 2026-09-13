@@ -81,6 +81,19 @@ pub trait CurvyIndexSource: Send + Sync + 'static {
     /// pending or committed. A chain that has never seen a note this node recorded is not the
     /// chain the record came from.
     async fn note_known(&self, note_id: String) -> Result<bool, String>;
+
+    /// Committed notes strictly after `after`, carrying what the detector scans, for sources
+    /// whose pending view can miss a note. Curvy's indexer serves finalized checkpoints only, so
+    /// a note the batch prover commits before its announcement finalizes is never seen pending —
+    /// and a note is only ever discovered as a candidate. The default is the empty page, which
+    /// is right for Blokli: its pending stream is complete.
+    async fn committed_candidates(
+        &self,
+        _after: Option<CurvyEventCursor>,
+        _first: u32,
+    ) -> Result<Vec<CurvyPendingNote>, String> {
+        Ok(Vec::new())
+    }
 }
 
 /// [`CurvyIndexSource`] over a real Blokli client.
@@ -401,6 +414,29 @@ where
     let mut committed_after = tracker
         .catch_up_cursor(CurvyEventKind::Committed, replay_history)
         .map_err(|error| error.to_string())?;
+    // Notes committed before this watcher ever saw them pending get their discovery here, from
+    // the cursor the completion pass below starts at, so no committed note passes that cursor
+    // undetected. Recording a candidate twice is harmless.
+    let mut candidate_after = committed_after.clone();
+    loop {
+        let page = client
+            .committed_candidates(candidate_after.clone(), QUERY_PAGE_SIZE)
+            .await?;
+        let page_len = page.len();
+        for candidate in page {
+            candidate_after = Some(CurvyEventCursor::from(&candidate.position));
+            if !tracker
+                .process_candidate(candidate)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(());
+            }
+        }
+        if page_len < QUERY_PAGE_SIZE as usize {
+            break;
+        }
+    }
     loop {
         let page = client.committed_notes(committed_after.clone(), QUERY_PAGE_SIZE).await?;
         let page_len = page.len();

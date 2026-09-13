@@ -208,6 +208,17 @@ struct CommittedRow {
     commit_block_number: u64,
     commit_block_hash: String,
     commit_tx_hash: String,
+    // What the detector scans, as the row carries it alongside the commit: a committed note
+    // can be discovered here when its pending announcement was never served (see
+    // `committed_candidate`).
+    ephemeral_key: Option<[String; 2]>,
+    view_tag: Option<u64>,
+    amount: Option<String>,
+    token: Option<String>,
+    is_plaintext: Option<bool>,
+    block_number: Option<u64>,
+    request_block_hash: Option<String>,
+    request_tx_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -280,6 +291,34 @@ fn pending_note(row: &PendingRow, item_index: u64) -> Result<CurvyPendingNote, S
             event_item_index: uint64(item_index),
         },
     })
+}
+
+/// A committed row as a discovery candidate — the shape `/sync/pending` serves, positioned at
+/// the announcement and cursored by the leaf index — or `None` when the row carries no delivery
+/// data to scan.
+fn committed_candidate(row: &CommittedRow) -> Result<Option<CurvyPendingNote>, String> {
+    let Some(ephemeral_key) = row.ephemeral_key.as_ref() else {
+        return Ok(None);
+    };
+    Ok(Some(CurvyPendingNote {
+        note_id: canonical_hex32(&row.note_id)?,
+        ephemeral_key: vec![
+            Uint256(hex_to_dec(&ephemeral_key[0])?),
+            Uint256(hex_to_dec(&ephemeral_key[1])?),
+        ],
+        view_tag: i32::try_from(row.view_tag.unwrap_or(0)).map_err(|_| "view tag does not fit i32".to_owned())?,
+        token_id: Uint256(hex_to_dec(row.token.as_deref().unwrap_or("0"))?),
+        amount: Uint256(hex_to_dec(row.amount.as_deref().unwrap_or("0"))?),
+        is_plaintext: row.is_plaintext.unwrap_or(false),
+        position: CurvyEventPosition {
+            transaction_hash: canonical_hex32(row.request_tx_hash.as_deref().unwrap_or(&row.commit_tx_hash))?,
+            block_hash: canonical_hex32(row.request_block_hash.as_deref().unwrap_or(&row.commit_block_hash))?,
+            block: uint64(row.block_number.unwrap_or(row.commit_block_number)),
+            transaction_index: uint64(0),
+            log_index: uint64(0),
+            event_item_index: uint64(row.index),
+        },
+    }))
 }
 
 fn committed_note(row: &CommittedRow) -> Result<CurvyCommittedNote, String> {
@@ -419,6 +458,22 @@ impl<A: SyncApi> CurvyIndexSource for CurvyIndexerSource<A> {
         };
         let page: Page<CommittedRow> = self.0.page("/sync/notes", from, first, None).await?;
         page.items.iter().map(committed_note).collect()
+    }
+
+    async fn committed_candidates(
+        &self,
+        after: Option<CurvyEventCursor>,
+        first: u32,
+    ) -> Result<Vec<CurvyPendingNote>, String> {
+        let from = match after {
+            Some(cursor) => cursor_item_index(&cursor)? + 1,
+            None => 0,
+        };
+        let page: Page<CommittedRow> = self.0.page("/sync/notes", from, first, None).await?;
+        page.items
+            .iter()
+            .filter_map(|row| committed_candidate(row).transpose())
+            .collect()
     }
 
     async fn indexed_head(&self) -> Result<(u64, u64), String> {
@@ -773,6 +828,37 @@ mod tests {
             .await
             .map_err(anyhow::Error::msg)?;
         assert_eq!(again.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn committed_rows_double_as_candidates_positioned_at_the_announcement() -> anyhow::Result<()> {
+        // A note the batch prover commits before its announcement finalizes is never served
+        // pending, so the committed row must be scannable on its own.
+        let source = CurvyIndexerSource(client());
+        let candidates = source
+            .committed_candidates(None, 100)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].note_id.0,
+            "0x010500f858617e38120921b1eb86a5d7cd896a22a0f1b92f032bbdc11a421412"
+        );
+        assert_eq!(candidates[0].view_tag, 75);
+        assert_eq!(candidates[0].amount.0, "1198800");
+        assert_eq!(candidates[0].position.block.0, "479247300", "the announcement block");
+        assert_eq!(
+            candidates[0].position.event_item_index.0, "0",
+            "cursored by the leaf index"
+        );
+        assert_eq!(candidates[1].position.event_item_index.0, "1");
+        let cursor = CurvyEventCursor::from(&candidates[0].position);
+        let rest = source
+            .committed_candidates(Some(cursor), 100)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(rest.len(), 1, "resumes after the leaf index");
         Ok(())
     }
 
