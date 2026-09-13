@@ -30,6 +30,7 @@
 use std::time::Duration;
 
 use blokli_client::exports::Url;
+use hopr_api::types::primitive::prelude::U256;
 use serde::Deserialize;
 
 use crate::errors::StrategyError;
@@ -133,6 +134,162 @@ impl PaymasterInfo {
             .ok_or_else(|| StrategyError::other(anyhow::anyhow!("the relayer's buffered gas quote overflows")))?;
         Ok(buffered)
     }
+
+    /// The fee note's value in the vault token it is paid in: [`Self::required_fee`], which is
+    /// native gas, converted at the two USD prices the way the relayer's `gasCostInToken` does
+    /// (`ceil(native_wei * native_usd * 10^token_decimals / (10^native_decimals * token_usd))`),
+    /// so the note clears the gate's threshold by the client buffer rather than by luck.
+    pub fn required_fee_in_token(
+        &self,
+        native: &TokenValuation,
+        token: &TokenValuation,
+    ) -> Result<u128, StrategyError> {
+        let native_wei = self.required_fee()?;
+        convert_token_amount(native_wei, native, token)
+    }
+}
+
+/// A currency of a network as `GET /networks` lists it, reduced to what pricing a fee note needs.
+#[derive(Clone, Debug, Deserialize)]
+pub struct NetworkCurrency {
+    pub symbol: String,
+    /// USD price as a decimal string; `None` until the price refresher has seen the currency.
+    pub price: Option<String>,
+    pub decimals: u32,
+    /// The vault token id, for the currencies the vault registers.
+    #[serde(rename = "vaultTokenId")]
+    pub vault_token_id: Option<String>,
+    #[serde(rename = "nativeCurrency")]
+    pub native_currency: bool,
+}
+
+/// A network as `GET /networks` lists it.
+#[derive(Clone, Debug, Deserialize)]
+pub struct NetworkInfo {
+    pub slug: String,
+    #[serde(rename = "chainId")]
+    pub chain_id: String,
+    pub currencies: Vec<NetworkCurrency>,
+}
+
+/// The gateway's `{data, error}` envelope around the network list.
+#[derive(Deserialize)]
+struct NetworksEnvelope {
+    data: Option<Vec<NetworkInfo>>,
+    error: Option<serde_json::Value>,
+}
+
+impl NetworksEnvelope {
+    fn into_network(self, chain_id: u64) -> Result<NetworkInfo, RelayError> {
+        let networks = self.data.ok_or_else(|| {
+            RelayError::Transport(format!(
+                "the gateway published no networks: {}",
+                self.error
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "no error given".to_owned())
+            ))
+        })?;
+        let wanted = chain_id.to_string();
+        networks
+            .into_iter()
+            .find(|network| network.chain_id == wanted)
+            .ok_or_else(|| RelayError::Rejected(format!("the gateway lists no network with chain id {chain_id}")))
+    }
+}
+
+/// Decimal places the relayer scales USD prices to before integer arithmetic (`PRICE_DECIMALS`).
+pub const PRICE_DECIMALS: u32 = 8;
+
+/// A USD valuation the way the relayer's gas conversion carries it: the price scaled by
+/// `10^PRICE_DECIMALS`, and the token's own decimals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenValuation {
+    pub usd: U256,
+    pub decimals: u32,
+}
+
+impl TokenValuation {
+    pub fn of(currency: &NetworkCurrency) -> Result<Self, StrategyError> {
+        let price = currency.price.as_deref().ok_or_else(|| {
+            StrategyError::other(anyhow::anyhow!(
+                "the gateway has no USD price for {} yet",
+                currency.symbol
+            ))
+        })?;
+        Ok(Self {
+            usd: parse_usd_price(price)?,
+            decimals: currency.decimals,
+        })
+    }
+}
+
+/// The native currency's and the fee token's valuations on `network`, for a fee note in
+/// vault token `vault_token_id`.
+pub fn fee_note_valuations(
+    network: &NetworkInfo,
+    vault_token_id: u64,
+) -> Result<(TokenValuation, TokenValuation), StrategyError> {
+    let native = network
+        .currencies
+        .iter()
+        .find(|currency| currency.native_currency)
+        .ok_or_else(|| {
+            StrategyError::other(anyhow::anyhow!(
+                "the gateway lists no native currency for {}",
+                network.slug
+            ))
+        })?;
+    let wanted = vault_token_id.to_string();
+    let token = network
+        .currencies
+        .iter()
+        .find(|currency| currency.vault_token_id.as_deref() == Some(wanted.as_str()))
+        .ok_or_else(|| {
+            StrategyError::other(anyhow::anyhow!(
+                "the gateway lists no currency with vault token id {vault_token_id} on {}",
+                network.slug
+            ))
+        })?;
+    Ok((TokenValuation::of(native)?, TokenValuation::of(token)?))
+}
+
+/// `parseUsdPrice`: a decimal USD price string scaled to [`PRICE_DECIMALS`] places, extra
+/// places truncated, the way the relayer parses the same string.
+pub fn parse_usd_price(price: &str) -> Result<U256, StrategyError> {
+    let trimmed = price.trim();
+    let (whole, fraction) = trimmed.split_once('.').unwrap_or((trimmed, ""));
+    let digits = |part: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit());
+    if !digits(whole) || !(fraction.is_empty() || digits(fraction)) {
+        return Err(StrategyError::other(anyhow::anyhow!("malformed USD price {price:?}")));
+    }
+    let mut fraction = fraction.to_owned();
+    fraction.truncate(PRICE_DECIMALS as usize);
+    while fraction.len() < PRICE_DECIMALS as usize {
+        fraction.push('0');
+    }
+    let parse = |part: &str| {
+        U256::from_dec_str(part)
+            .map_err(|error| StrategyError::other(anyhow::anyhow!("malformed USD price {price:?}: {error}")))
+    };
+    let scaled = parse(whole)? * U256::exp10(PRICE_DECIMALS as usize) + parse(&fraction)?;
+    if scaled.is_zero() {
+        return Err(StrategyError::other(anyhow::anyhow!(
+            "non-positive USD price {price:?}"
+        )));
+    }
+    Ok(scaled)
+}
+
+/// `convertTokenAmount`: `amount` of `from` in units of `to`, rounded up.
+pub fn convert_token_amount(amount: u128, from: &TokenValuation, to: &TokenValuation) -> Result<u128, StrategyError> {
+    if from.usd.is_zero() || to.usd.is_zero() {
+        return Err(StrategyError::other(anyhow::anyhow!("token prices must be positive")));
+    }
+    let numerator = U256::from(amount) * from.usd * U256::exp10(to.decimals as usize);
+    let denominator = U256::exp10(from.decimals as usize) * to.usd;
+    let converted = (numerator + denominator - U256::one()) / denominator;
+    u128::try_from(converted)
+        .map_err(|_| StrategyError::other(anyhow::anyhow!("the converted fee note amount overflows u128")))
 }
 
 /// What the gateway publishes about the protocol as a whole at `GET /protocol`.
@@ -241,6 +398,19 @@ impl RelayClient {
             .await
             .map_err(|error| RelayError::Transport(error.to_string()))?;
         Self::decode::<ProtocolEnvelope>(response).await?.into_info()
+    }
+
+    /// The network `chain_id` as the gateway describes it: its currencies with the USD prices
+    /// the relayer converts gas into a fee-note amount with.
+    pub async fn network(&self, chain_id: u64) -> Result<NetworkInfo, RelayError> {
+        let url = self.endpoint("/networks")?;
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| RelayError::Transport(error.to_string()))?;
+        Self::decode::<NetworksEnvelope>(response).await?.into_network(chain_id)
     }
 
     /// Queues a proof for submission.
@@ -447,6 +617,69 @@ mod tests {
             .into_info()
             .expect_err("no data is an error");
         assert!(error.to_string().contains("protocol not configured"), "{error}");
+        Ok(())
+    }
+
+    /// `GET /networks` on Curvy staging, 2026-09-13, reduced to the Gnosis entry.
+    const STAGING_NETWORKS: &str = r#"{"data":[{"slug":"gnosis","chainId":"100","currencies":[{"id":39,"symbol":"XDAI","price":"1","decimals":18,"vaultTokenId":"1","nativeCurrency":true},{"id":40,"symbol":"WXHOPR","price":"0.011918","decimals":18,"vaultTokenId":"2","nativeCurrency":false},{"id":6,"symbol":"USDC","price":"0.9998271138189069","decimals":6,"vaultTokenId":null,"nativeCurrency":false}]}],"error":null}"#;
+
+    #[test]
+    fn usd_prices_are_scaled_to_eight_places_and_truncated() -> anyhow::Result<()> {
+        assert_eq!(parse_usd_price("1")?, U256::from(100_000_000u64));
+        assert_eq!(parse_usd_price("0.011918")?, U256::from(1_191_800u64));
+        assert_eq!(parse_usd_price("0.9998271138189069")?, U256::from(99_982_711u64));
+        assert!(parse_usd_price("0").is_err());
+        assert!(parse_usd_price("1e3").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn the_fee_note_is_priced_in_the_vault_token_like_the_relayer_prices_it() -> anyhow::Result<()> {
+        // 675 000 gas at 1 gwei is 6.75e14 wei of a $1 native; in a $0.50 six-decimal token
+        // that is 6.75e14 * 1e8 * 1e6 / (1e18 * 0.5e8) = 1350 units.
+        let native = TokenValuation {
+            usd: parse_usd_price("1")?,
+            decimals: 18,
+        };
+        let cheap = TokenValuation {
+            usd: parse_usd_price("0.5")?,
+            decimals: 6,
+        };
+        assert_eq!(
+            paymaster("675000", "1000000000", 0).required_fee_in_token(&native, &cheap)?,
+            1350
+        );
+        // Rounded up: one unit short would be refused by the gate.
+        let odd = TokenValuation {
+            usd: parse_usd_price("0.3")?,
+            decimals: 6,
+        };
+        assert_eq!(paymaster("1", "1", 0).required_fee_in_token(&native, &odd)?, 1);
+        // Staging's Gnosis numbers: the wxHOPR note is about 84x the native gas cost.
+        let network = serde_json::from_str::<NetworksEnvelope>(STAGING_NETWORKS)?.into_network(100)?;
+        let (native, wxhopr) = fee_note_valuations(&network, 2)?;
+        assert_eq!(
+            paymaster("675000", "1000000000", 0).required_fee_in_token(&native, &wxhopr)?,
+            56637019634166807
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fee_note_valuations_need_a_priced_native_and_token_currency() -> anyhow::Result<()> {
+        let network = serde_json::from_str::<NetworksEnvelope>(STAGING_NETWORKS)?.into_network(100)?;
+        assert!(fee_note_valuations(&network, 7).is_err(), "no such vault token");
+        assert!(
+            serde_json::from_str::<NetworksEnvelope>(STAGING_NETWORKS)?
+                .into_network(1)
+                .is_err()
+        );
+        let mut unpriced = network.clone();
+        unpriced.currencies[1].price = None;
+        assert!(
+            fee_note_valuations(&unpriced, 2).is_err(),
+            "an unpriced token cannot be converted"
+        );
         Ok(())
     }
 

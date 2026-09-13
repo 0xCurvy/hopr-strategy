@@ -1043,7 +1043,13 @@ where
                 accepted.join(", ")
             )));
         }
-        let amount = info.required_fee().map_err(|error| {
+        // The quote is native gas; the note is paid in the vault token, so it is converted at
+        // the gateway's USD prices the way the relayer's gate converts it.
+        let network = relay.network(chain_id).await.map_err(relay_error)?;
+        let (native, fee_token) = relayer::fee_note_valuations(&network, token).map_err(|error| {
+            RsSdkCurvyAdapterError::InvalidValue(format!("pricing the relayer's fee note: {error}"))
+        })?;
+        let amount = info.required_fee_in_token(&native, &fee_token).map_err(|error| {
             RsSdkCurvyAdapterError::InvalidValue(format!("pricing the relayer's fee note: {error}"))
         })?;
         let identity = stealth_identity(&info.operator, "the relayer's operator key")?;
