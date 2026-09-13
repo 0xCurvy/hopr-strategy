@@ -577,6 +577,10 @@ impl CurvyIndexSource for ScriptedIndex {
 #[derive(Default)]
 struct RecordingAdapter {
     funded: parking_lot::Mutex<Vec<(HoprBalance, Address)>>,
+    /// How many upcoming `allocate` calls answer "not in the committed tree yet".
+    tree_lag_failures: parking_lot::Mutex<usize>,
+    /// Every `allocate` call, successful or not.
+    allocate_attempts: parking_lot::Mutex<usize>,
     allocations: parking_lot::Mutex<Vec<(PixAddressId, BjjPublicKey, CurvyScanPublicKey, HoprBalance)>>,
     withdrawals: parking_lot::Mutex<Vec<(Address, usize)>>,
     consistent: parking_lot::Mutex<bool>,
@@ -593,8 +597,12 @@ impl RecordingAdapter {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("scripted adapter failure")]
-struct ScriptedFailure;
+#[error("{0}")]
+struct ScriptedFailure(String);
+
+/// What the SDK reports while the funding note is committed on chain but not yet in the tree the
+/// SDK rebuilds from its (finalized) snapshot.
+const TREE_LAG: &str = "Curvy SDK operation failed: PIX aggregation input not found in committed tree";
 
 #[async_trait]
 impl CurvySdkAdapter for RecordingAdapter {
@@ -609,6 +617,14 @@ impl CurvySdkAdapter for RecordingAdapter {
         &self,
         deposits: Vec<(PixAddressId, BjjPublicKey, CurvyScanPublicKey, HoprBalance)>,
     ) -> Result<(), Self::Error> {
+        *self.allocate_attempts.lock() += 1;
+        {
+            let mut lagging = self.tree_lag_failures.lock();
+            if *lagging > 0 {
+                *lagging -= 1;
+                return Err(ScriptedFailure(TREE_LAG.to_owned()));
+            }
+        }
         self.allocations.lock().extend(deposits);
         Ok(())
     }
@@ -954,6 +970,81 @@ async fn pool_transfer_is_not_supported() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 // Mode configuration
 // ---------------------------------------------------------------------------
+
+#[test_log::test(tokio::test)]
+async fn a_deposit_waits_for_the_committed_tree_instead_of_failing() -> anyhow::Result<()> {
+    // The funding note is on chain but the SDK's tree does not have it yet: two early attempts,
+    // then it is there. On a relayed deployment this is the normal shape of the first deposit.
+    let adapter = RecordingAdapter::consistent();
+    *adapter.tree_lag_failures.lock() = 2;
+    let harness = harness(adapter, Duration::from_secs(2)).await?;
+    let pool = &harness.pool;
+    let id = pix_id(1);
+    let owner = BjjKeypair::random();
+    let data = pool.generate_deposit_data(&id).await?;
+    let started = std::time::Instant::now();
+    pool.deposit_funds_to(&id, owner.public(), ten(), data.clone()).await?;
+    assert_eq!(
+        *harness.adapter.allocate_attempts.lock(),
+        3,
+        "two waits, then the allocation"
+    );
+    assert_eq!(harness.adapter.allocations.lock().len(), 1);
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "it waited between attempts"
+    );
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn a_tree_that_never_catches_up_fails_within_the_tracking_budget() -> anyhow::Result<()> {
+    let adapter = RecordingAdapter::consistent();
+    *adapter.tree_lag_failures.lock() = usize::MAX;
+    let harness = harness(adapter, Duration::from_secs(1)).await?;
+    let pool = &harness.pool;
+    let id = pix_id(1);
+    let owner = BjjKeypair::random();
+    let data = pool.generate_deposit_data(&id).await?;
+    let started = std::time::Instant::now();
+    let error = pool
+        .deposit_funds_to(&id, owner.public(), ten(), data)
+        .await
+        .expect_err("the budget runs out");
+    assert!(error.to_string().contains("not found in committed tree"), "{error}");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "gave up after the budget, took {elapsed:?}"
+    );
+    assert!(
+        *harness.adapter.allocate_attempts.lock() >= 3,
+        "kept trying until the budget ran out"
+    );
+    assert!(harness.adapter.allocations.lock().is_empty());
+    Ok(())
+}
+
+#[test]
+fn tree_lag_is_recognised_and_polled_at_a_tenth_of_the_budget() {
+    assert!(super::is_tree_lag(TREE_LAG));
+    assert!(super::is_tree_lag(
+        "sync: index did not reconcile after retries: 1 indexed leaves ..."
+    ));
+    assert!(!super::is_tree_lag("no committed note large enough"));
+    assert_eq!(
+        super::tree_lag_poll_interval(Duration::from_secs(600)),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        super::tree_lag_poll_interval(Duration::from_secs(1)),
+        Duration::from_millis(100)
+    );
+    assert_eq!(
+        super::tree_lag_poll_interval(Duration::from_millis(100)),
+        Duration::from_millis(50)
+    );
+}
 
 #[test]
 fn mode_defaults_are_direct_shielding_over_the_relayer() {

@@ -1151,18 +1151,66 @@ where
             .ensure_funded(self.initial_funding, safe_address)
             .await
             .map_err(|error| StrategyError::other(CurvyDepositPoolError::Adapter(error.into())))?;
-        self.adapter.allocate(deposits).await.map_err(|error| {
-            let message = error.to_string();
-            // Out of shielded funds is the expected end of a run, not a fault: the strategy's
-            // budget usually gets there first, and either way the kill switch ends the Session.
-            if message.contains("no committed note large enough") {
-                tracing::warn!(%error, "the Curvy pool has no funding left for this deposit");
-                StrategyError::CriteriaNotSatisfied
-            } else {
-                StrategyError::other(CurvyDepositPoolError::Adapter(error.into()))
+        // The funding note has to be *committed* before it can be spent, and committed by
+        // whoever commits on this deployment: under `submission: relayer` that is the shared
+        // batch-prover, on its own schedule, and the SDK's tree — read from a finalized
+        // checkpoint when the notes come from Curvy's indexer — follows later still. A deposit
+        // that arrives in that window is not a failure, it is early: wait for the tree, within
+        // the same budget discovery gets, rather than fail the flush. The strategy's spend
+        // ledger is never refunded (by design), so failing here would burn the budget on a race.
+        let deadline = tokio::time::Instant::now() + self.cfg.max_deposit_tracking_time;
+        let poll = tree_lag_poll_interval(self.cfg.max_deposit_tracking_time);
+        let mut waited = 0u32;
+        loop {
+            match self.adapter.allocate(deposits.clone()).await {
+                Ok(()) => {
+                    if waited > 0 {
+                        tracing::info!(
+                            attempts = waited + 1,
+                            "allocated once the funding note reached the committed tree"
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(error) if is_tree_lag(&error.to_string()) && tokio::time::Instant::now() + poll < deadline => {
+                    waited += 1;
+                    tracing::info!(
+                        %error,
+                        attempt = waited,
+                        retry_in = ?poll,
+                        "the funding note is not in the committed tree yet; waiting"
+                    );
+                    tokio::time::sleep(poll).await;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    // Out of shielded funds is the expected end of a run, not a fault: the
+                    // strategy's budget usually gets there first, and either way the kill switch
+                    // ends the Session.
+                    return Err(if message.contains("no committed note large enough") {
+                        tracing::warn!(%error, "the Curvy pool has no funding left for this deposit");
+                        StrategyError::CriteriaNotSatisfied
+                    } else {
+                        StrategyError::other(CurvyDepositPoolError::Adapter(error.into()))
+                    });
+                }
             }
-        })
+        }
     }
+}
+
+/// Whether an allocation error means "the input is not in the committed tree *yet*" — the SDK
+/// could not find the funding note among the committed leaves, or its snapshot and the chain
+/// disagreed while a commitment was still settling — rather than a fault. Matched on text because
+/// the SDK reports both as opaque `anyhow` messages.
+fn is_tree_lag(message: &str) -> bool {
+    message.contains("not found in committed tree") || message.contains("index did not reconcile")
+}
+
+/// How often to re-try an allocation that is waiting for the committed tree: a tenth of the
+/// budget, at most every five seconds, so a short budget still gets several attempts.
+fn tree_lag_poll_interval(budget: Duration) -> Duration {
+    (budget / 10).min(Duration::from_secs(5)).max(Duration::from_millis(50))
 }
 
 impl<N, I, A, S> Drop for CurvyDepositPool<N, I, A, S> {
