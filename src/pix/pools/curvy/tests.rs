@@ -1032,6 +1032,15 @@ fn tree_lag_is_recognised_and_polled_at_a_tenth_of_the_budget() {
         "sync: index did not reconcile after retries: 1 indexed leaves ..."
     ));
     assert!(!super::is_tree_lag("no committed note large enough"));
+    // A rate-limited or failed RPC read behind Blokli is waited out the same way.
+    assert!(super::is_retryable_lag(
+        "Curvy SDK operation failed: submission rejected: curvyVaultFees failed: RPC_ERROR RPC error \
+         during query Curvy Vault fees: Max retries exceeded HTTP error 429 with body: 429 Too Many Requests"
+    ));
+    assert!(!super::is_retryable_lag("no committed note large enough"));
+    assert!(!super::is_retryable_lag(
+        "aggregation carries a non-zero protocol fee but no fee-collector identity"
+    ));
     assert_eq!(
         super::tree_lag_poll_interval(Duration::from_secs(600)),
         Duration::from_secs(5)

@@ -1172,13 +1172,13 @@ where
                     }
                     return Ok(());
                 }
-                Err(error) if is_tree_lag(&error.to_string()) && tokio::time::Instant::now() + poll < deadline => {
+                Err(error) if is_retryable_lag(&error.to_string()) && tokio::time::Instant::now() + poll < deadline => {
                     waited += 1;
                     tracing::info!(
                         %error,
                         attempt = waited,
                         retry_in = ?poll,
-                        "the funding note is not in the committed tree yet; waiting"
+                        "the committed tree or the chain read behind it is not ready yet; waiting"
                     );
                     tokio::time::sleep(poll).await;
                 }
@@ -1205,6 +1205,22 @@ where
 /// the SDK reports both as opaque `anyhow` messages.
 fn is_tree_lag(message: &str) -> bool {
     message.contains("not found in committed tree") || message.contains("index did not reconcile")
+}
+
+/// A chain read that failed on the way to the RPC rather than in the protocol: a rate limit or a
+/// transport failure surfacing through Blokli. The next attempt sees a different answer, so it is
+/// waited out like tree lag instead of burning the deposit's spend budget.
+fn is_transient_chain_read(message: &str) -> bool {
+    message.contains("RPC_ERROR")
+        || message.contains("Max retries exceeded")
+        || message.contains("HTTP error 429")
+        || message.contains("HTTP error 5")
+}
+
+/// What an allocation attempt waits out within its budget: the committed tree catching up, or
+/// the chain read behind it failing transiently.
+fn is_retryable_lag(message: &str) -> bool {
+    is_tree_lag(message) || is_transient_chain_read(message)
 }
 
 /// How often to re-try an allocation that is waiting for the committed tree: a tenth of the
