@@ -85,15 +85,14 @@ pub trait CurvyIndexSource: Send + Sync + 'static {
     /// Committed notes strictly after `after`, carrying what the detector scans, for sources
     /// whose pending view can miss a note. Curvy's indexer serves finalized checkpoints only, so
     /// a note the batch prover commits before its announcement finalizes is never seen pending —
-    /// and a note is only ever discovered as a candidate. The default is the empty page, which
-    /// is right for Blokli: its pending stream is complete.
+    /// and a note is only ever discovered as a candidate. A source whose pending stream is
+    /// complete, like Blokli, serves the empty page. Deliberately not defaulted: a wrapper that
+    /// forgets to delegate it would silently lose every such note.
     async fn committed_candidates(
         &self,
-        _after: Option<CurvyEventCursor>,
-        _first: u32,
-    ) -> Result<Vec<CurvyPendingNote>, String> {
-        Ok(Vec::new())
-    }
+        after: Option<CurvyEventCursor>,
+        first: u32,
+    ) -> Result<Vec<CurvyPendingNote>, String>;
 }
 
 /// [`CurvyIndexSource`] over a real Blokli client.
@@ -149,6 +148,15 @@ where
             .await
             .map(|status| status.status != 0)
             .map_err(|error| error.to_string())
+    }
+
+    async fn committed_candidates(
+        &self,
+        _after: Option<CurvyEventCursor>,
+        _first: u32,
+    ) -> Result<Vec<CurvyPendingNote>, String> {
+        // Blokli's pending stream is complete: every note is served pending before committed.
+        Ok(Vec::new())
     }
 }
 

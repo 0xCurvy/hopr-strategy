@@ -774,6 +774,17 @@ impl CurvyIndexSource for NoteIndex {
             Self::CurvyIndexer(index) => index.note_known(note_id).await,
         }
     }
+
+    async fn committed_candidates(
+        &self,
+        after: Option<CurvyEventCursor>,
+        first: u32,
+    ) -> Result<Vec<CurvyPendingNote>, String> {
+        match self {
+            Self::Blokli(index) => index.committed_candidates(after, first).await,
+            Self::CurvyIndexer(index) => index.committed_candidates(after, first).await,
+        }
+    }
 }
 
 /// A [`DepositPool`] settling through the Curvy shielded pool. See the module documentation.
