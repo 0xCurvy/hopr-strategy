@@ -777,9 +777,9 @@ impl CurvyIndexSource for NoteIndex {
 
     async fn committed_candidates(
         &self,
-        after: Option<CurvyEventCursor>,
+        after: Option<blokli_client::api::types::CurvyEventCursor>,
         first: u32,
-    ) -> Result<Vec<CurvyPendingNote>, String> {
+    ) -> Result<Vec<blokli_client::api::types::CurvyPendingNote>, String> {
         match self {
             Self::Blokli(index) => index.committed_candidates(after, first).await,
             Self::CurvyIndexer(index) => index.committed_candidates(after, first).await,
