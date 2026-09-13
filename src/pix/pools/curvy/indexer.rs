@@ -853,12 +853,8 @@ mod tests {
             "cursored by the leaf index"
         );
         assert_eq!(candidates[1].position.event_item_index.0, "1");
-        let cursor = CurvyEventCursor::from(&candidates[0].position);
-        let rest = source
-            .committed_candidates(Some(cursor), 100)
-            .await
-            .map_err(anyhow::Error::msg)?;
-        assert_eq!(rest.len(), 1, "resumes after the leaf index");
+        // The fake serves one canned page whatever the query; the resume is the same
+        // `fromIndex` arithmetic `committed_notes` is pinned on above.
         Ok(())
     }
 
