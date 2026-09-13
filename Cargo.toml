@@ -64,9 +64,11 @@ strategy-pix-curvy = [
   "dep:blokli-client",
   "dep:const-hex",
   "dep:curvy-abi",
+  "dep:curvy-chain-api",
   "dep:curvy-chain-blokli",
   "dep:curvy-core",
   "dep:curvy-sdk",
+  "dep:curvy-types",
   "dep:reqwest",
   "dep:serde_json",
   "dep:zeroize",
@@ -132,9 +134,11 @@ const-hex     = { workspace = true, optional = true }
 curvy-abi     = { workspace = true, optional = true }
 # The relayer's HTTP surface. Already in the graph via `blokli-client` and `alloy`, so this
 # declares a dependency rather than adding one.
+curvy-chain-api = { workspace = true, optional = true }
 curvy-chain-blokli = { workspace = true, optional = true }
 curvy-core = { workspace = true, optional = true }
 curvy-sdk = { workspace = true, optional = true }
+curvy-types = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true, default-features = false, features = [
   "json",
   "rustls",
@@ -184,9 +188,11 @@ const-hex        = "1.19.1"
 # The Curvy crates are pre-release and change API between release candidates; `curvy-sdk` pins
 # `curvy-core` exactly, so these three must name the same candidate and move together.
 curvy-abi            = "=0.1.0-rc.6"
+curvy-chain-api      = "=0.1.0-rc.6"
 curvy-chain-blokli   = "=0.1.0-rc.6"
 curvy-core           = "=0.1.0-rc.6"
 curvy-sdk            = "=0.1.0-rc.6"
+curvy-types          = "=0.1.0-rc.6"
 dashmap              = "6.2.1"
 futures              = "0.3.34"
 futures-concurrency  = "7.7.1"

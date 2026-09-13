@@ -36,6 +36,7 @@ use hopr_api::{
 };
 
 use super::{
+    CurvyNoteSource,
     detect::{bjj_point, public_key_from_dec, scan_public_key_dec, shared_secret_from_scan_match},
     lifecycle::CurvyLifecycleTracker,
     *,
@@ -1032,6 +1033,83 @@ fn a_config_without_the_mode_keys_still_parses() -> anyhow::Result<()> {
     )?;
     assert_eq!(cfg.shielding, CurvyShielding::Direct);
     assert_eq!(cfg.submission, CurvySubmission::Relayer);
+    Ok(())
+}
+
+#[test]
+fn the_note_source_defaults_to_blokli_and_the_indexer_needs_its_url() -> anyhow::Result<()> {
+    let cfg = CurvyDepositPoolConfig::default();
+    assert_eq!(cfg.note_source, CurvyNoteSource::Blokli);
+    assert!(cfg.curvy_indexer_url.is_none());
+    StrategyError::validate_config(&cfg)?;
+
+    // `submission: operator` so the relayer rule stays out of the way; it is checked first.
+    let without_url = CurvyDepositPoolConfig {
+        note_source: CurvyNoteSource::CurvyIndexer,
+        submission: CurvySubmission::Operator,
+        ..Default::default()
+    };
+    let error = super::validate_mode_requirements(&without_url).expect_err("an indexer needs a URL");
+    assert!(error.to_string().contains("curvy_indexer_url"), "{error}");
+
+    let with_url = CurvyDepositPoolConfig {
+        note_source: CurvyNoteSource::CurvyIndexer,
+        curvy_indexer_url: Some("https://api.curvy.dev".parse()?),
+        submission: CurvySubmission::Operator,
+        ..Default::default()
+    };
+    super::validate_mode_requirements(&with_url)?;
+
+    // The YAML/JSON spelling and the environment spellings.
+    let parsed: CurvyDepositPoolConfig =
+        serde_json::from_str(r#"{"note_source":"curvy_indexer","curvy_indexer_url":"https://api.curvy.dev/"}"#)?;
+    assert_eq!(parsed.note_source, CurvyNoteSource::CurvyIndexer);
+    for spelling in ["curvy_indexer", "curvy-indexer", "CURVY_INDEXER", "indexer"] {
+        assert_eq!(
+            spelling.parse::<CurvyNoteSource>()?,
+            CurvyNoteSource::CurvyIndexer,
+            "{spelling}"
+        );
+    }
+    assert_eq!("blokli".parse::<CurvyNoteSource>()?, CurvyNoteSource::Blokli);
+    assert!("rpc".parse::<CurvyNoteSource>().is_err());
+    Ok(())
+}
+
+/// Against Curvy's staging indexer for Gnosis. Network; run by hand:
+/// `cargo test --all-features --lib staging_indexer -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "talks to https://api.curvy.dev"]
+async fn staging_indexer_serves_gnosis_notes() -> anyhow::Result<()> {
+    use super::indexer::{CurvyIndexerClient, CurvyIndexerNotes, CurvyIndexerSource, HttpSyncApi};
+    let api =
+        HttpSyncApi::new("https://api.curvy.dev".parse()?, Duration::from_secs(30)).map_err(anyhow::Error::msg)?;
+    let source = CurvyIndexerSource(CurvyIndexerClient::new(api, Arc::new(100u64)));
+    let (head, finality) = source.indexed_head().await.map_err(anyhow::Error::msg)?;
+    println!("gnosis finalized head {head}, finality {finality}");
+    assert!(head > 48_060_257, "past the aggregator's deployment block");
+    let pending = source.pending_notes(None, 10).await.map_err(anyhow::Error::msg)?;
+    let committed = source.committed_notes(None, 10).await.map_err(anyhow::Error::msg)?;
+    println!("pending {} committed {}", pending.len(), committed.len());
+    assert!(
+        !source
+            .nullifier_spent("0x01".to_owned())
+            .await
+            .map_err(anyhow::Error::msg)?
+    );
+
+    let api =
+        HttpSyncApi::new("https://api.curvy.dev".parse()?, Duration::from_secs(30)).map_err(anyhow::Error::msg)?;
+    let notes = CurvyIndexerNotes(CurvyIndexerClient::new(api, Arc::new(100u64)));
+    let snapshot = curvy_chain_api::NoteIndexSource::notes_tree_snapshot(&notes)
+        .await?
+        .expect("a finalized checkpoint");
+    println!(
+        "snapshot {} with {} leaves, root {}",
+        snapshot.checkpoint,
+        snapshot.leaves.len(),
+        snapshot.notes_root
+    );
     Ok(())
 }
 

@@ -62,8 +62,9 @@ use redb::{ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CommittedCurvyNote, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome, Url,
+    CommittedCurvyNote, CurvyNoteSource, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome, Url,
     detect::{bjj_point, scan_public_key_dec},
+    indexer,
     relayer::RelayClient,
     state::{RedbCurvyDepositState, id_bytes},
 };
@@ -162,6 +163,11 @@ pub struct RsSdkCurvyAdapterConfig {
     pub relayer_url: Option<Url>,
     /// How long to wait for a relayed submission to reach the chain.
     pub relay_timeout: std::time::Duration,
+    /// Where the SDK reads notes from when it rebuilds the committed-notes tree. See
+    /// [`CurvyNoteSource`].
+    pub note_source: CurvyNoteSource,
+    /// Curvy's shared indexer, required under [`CurvyNoteSource::CurvyIndexer`].
+    pub curvy_indexer_url: Option<Url>,
 }
 
 impl RsSdkCurvyAdapterConfig {
@@ -178,10 +184,20 @@ impl RsSdkCurvyAdapterConfig {
             submission: CurvySubmission::Operator,
             relayer_url: None,
             relay_timeout: std::time::Duration::from_secs(120),
+            note_source: CurvyNoteSource::Blokli,
+            curvy_indexer_url: None,
         }
     }
 
     /// Applies the pool's configured modes.
+    /// Selects where the SDK reads notes from; `curvy_indexer_url` is required for
+    /// [`CurvyNoteSource::CurvyIndexer`] and validated by the pool before this is reached.
+    pub fn with_note_source(mut self, note_source: CurvyNoteSource, curvy_indexer_url: Option<Url>) -> Self {
+        self.note_source = note_source;
+        self.curvy_indexer_url = curvy_indexer_url;
+        self
+    }
+
     pub fn with_modes(
         mut self,
         shielding: CurvyShielding,
@@ -551,13 +567,20 @@ impl CurvyChainEndpoints {
     }
 }
 
-/// Constructs a Curvy client whose reads and submissions all go through Blokli.
-pub fn blokli_curvy_client(blokli_url: impl Into<String>, endpoints: &CurvyChainEndpoints) -> Arc<CurvyClient> {
+/// Constructs a Curvy client whose reads and submissions go through Blokli — except, when
+/// `notes` is given, the note index the SDK rebuilds its tree from (see
+/// [`CurvyNoteSource::CurvyIndexer`]).
+pub fn blokli_curvy_client(
+    blokli_url: impl Into<String>,
+    endpoints: &CurvyChainEndpoints,
+    notes: Option<Arc<dyn curvy_chain_api::NoteIndexSource>>,
+) -> Arc<CurvyClient> {
     let blokli = Arc::new(curvy_chain_blokli::BlokliChain::new(blokli_url));
+    let notes: Arc<dyn curvy_chain_api::NoteIndexSource> = notes.unwrap_or_else(|| blokli.clone());
     Arc::new(CurvyClient::new(
         blokli.clone(),
         blokli.clone(),
-        blokli.clone(),
+        notes,
         blokli.clone(),
         blokli.clone(),
         blokli.clone(),
@@ -653,7 +676,27 @@ where
                     chain_id = endpoints.chain_id,
                     "discovered the Curvy deployment through Blokli"
                 );
-                let client = blokli_curvy_client(self.blokli_url.clone(), &endpoints);
+                let notes: Option<Arc<dyn curvy_chain_api::NoteIndexSource>> = match self.config.note_source {
+                    CurvyNoteSource::Blokli => None,
+                    CurvyNoteSource::CurvyIndexer => {
+                        let url = self.config.curvy_indexer_url.clone().ok_or_else(|| {
+                            RsSdkCurvyAdapterError::InvalidValue(
+                                "`note_source: curvy_indexer` needs `curvy_indexer_url`".to_owned(),
+                            )
+                        })?;
+                        let api = indexer::HttpSyncApi::new(url, super::INDEXER_REQUEST_TIMEOUT)
+                            .map_err(RsSdkCurvyAdapterError::InvalidValue)?;
+                        tracing::info!(
+                            chain_id = endpoints.chain_id,
+                            "reading Curvy notes from Curvy's indexer"
+                        );
+                        Some(Arc::new(indexer::CurvyIndexerNotes(indexer::CurvyIndexerClient::new(
+                            api,
+                            Arc::new(endpoints.chain_id),
+                        ))))
+                    }
+                };
+                let client = blokli_curvy_client(self.blokli_url.clone(), &endpoints, notes);
                 Ok((client, endpoints))
             })
             .await

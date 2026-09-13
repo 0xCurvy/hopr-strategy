@@ -31,6 +31,7 @@
 //! |---|---|---|
 //! | [`CurvyDepositPoolConfig::shielding`] | `direct` — the Safe calls `directShield`, no portal | `portal` — fund a deterministic entry portal, then deploy and shield it |
 //! | [`CurvyDepositPoolConfig::submission`] | `relayer` — hand proofs to Curvy's off-chain relayer | `operator` — sign and submit them here |
+//! | [`CurvyDepositPoolConfig::note_source`] | `blokli` — notes from Blokli's own Curvy index | `curvy_indexer` — notes from Curvy's shared indexer (`/sync`), see [`indexer`] |
 //!
 //! Both defaults describe a production deployment. The localcluster runs
 //! `submission: operator`, since it has no off-chain Curvy infrastructure at all.
@@ -64,6 +65,9 @@
 //! * A **Blokli endpoint** ([`CurvyDepositPoolConfig::blokli_url`]) whose `chain_info` names the Curvy deployment
 //!   (`curvy_aggregator`, `curvy_vault`, `token`, and `curvy_portal_factory` where one exists) and that indexes Curvy
 //!   notes. Reads go through it, and so do submissions under `submission: operator`.
+//! * A **Curvy indexer endpoint** ([`CurvyDepositPoolConfig::curvy_indexer_url`]) under `note_source: curvy_indexer` —
+//!   the same gateway host as the relayer. Only notes are read from it; Blokli still serves everything else, and need
+//!   not have indexed Curvy at all.
 //! * A **relayer endpoint** ([`CurvyDepositPoolConfig::relayer_url`]) under `submission: relayer` — `https://api.curvy.box`
 //!   in production, `https://api.curvy.dev` for staging. No default: pointing a misconfigured node at a production
 //!   relayer is worse than refusing to start.
@@ -100,6 +104,7 @@
 //! [`DepositPool`]: hopr_api::chain::DepositPool
 
 mod detect;
+pub mod indexer;
 mod lifecycle;
 mod module;
 pub mod relayer;
@@ -204,6 +209,46 @@ pub const RELAYER_URL_ENV: &str = "HOPRD_CURVY_RELAYER_URL";
 /// plain pool's config type. Getting it wrong is silent (see the field docs), so a cluster run
 /// against a real deployment must be able to state it.
 pub const TOKEN_ENV: &str = "HOPRD_CURVY_TOKEN";
+
+/// Environment variable that overrides [`CurvyDepositPoolConfig::note_source`].
+///
+/// Accepts `blokli` or `curvy_indexer`.
+pub const NOTE_SOURCE_ENV: &str = "HOPRD_CURVY_NOTE_SOURCE";
+
+/// Environment variable that overrides [`CurvyDepositPoolConfig::curvy_indexer_url`].
+pub const INDEXER_URL_ENV: &str = "HOPRD_CURVY_INDEXER_URL";
+
+/// Where the pool reads Curvy notes from.
+///
+/// Only the *notes* — pending, committed, nullifiers, and the committed-notes tree the SDK
+/// proves against. Discovery, fee and status reads, nonces and submissions go through Blokli
+/// whichever is chosen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurvyNoteSource {
+    /// Blokli's own Curvy index, built from the aggregator's events on chain. Self-contained.
+    #[default]
+    Blokli,
+    /// Curvy's shared indexer for the deployment (`/sync` on the gateway named by
+    /// [`CurvyDepositPoolConfig::curvy_indexer_url`]). Ready as soon as that service is; useful
+    /// when the node's Blokli has not indexed Curvy, or is still catching up. See
+    /// [`indexer`](self::indexer).
+    CurvyIndexer,
+}
+
+impl FromStr for CurvyNoteSource {
+    type Err = StrategyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "blokli" => Ok(Self::Blokli),
+            "curvy_indexer" | "indexer" | "curvy" => Ok(Self::CurvyIndexer),
+            other => Err(StrategyError::InvalidConfiguration(format!(
+                "Curvy note source must be `blokli` or `curvy_indexer`, got `{other}`"
+            ))),
+        }
+    }
+}
 
 /// How the pool moves the node's float into the shielded vault.
 ///
@@ -325,6 +370,12 @@ fn validate_mode_requirements(cfg: &CurvyDepositPoolConfig) -> Result<(), Strate
              {SUBMISSION_ENV}=operator) to sign and submit from this node"
         )));
     }
+    if cfg.note_source == CurvyNoteSource::CurvyIndexer && cfg.curvy_indexer_url.is_none() {
+        return Err(StrategyError::InvalidConfiguration(format!(
+            "`note_source: curvy_indexer` needs `curvy_indexer_url` (or {INDEXER_URL_ENV}); set it, or select \
+             `note_source: blokli` to read notes from Blokli's own Curvy index"
+        )));
+    }
     Ok(())
 }
 
@@ -431,6 +482,17 @@ pub struct CurvyDepositPoolConfig {
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(default)]
     pub relayer_url: Option<Url>,
+    /// Where notes are read from. Default: [`CurvyNoteSource::Blokli`]. Overridden by
+    /// [`NOTE_SOURCE_ENV`].
+    #[serde(default)]
+    pub note_source: CurvyNoteSource,
+    /// Base URL of Curvy's shared indexer — the gateway host, `https://api.curvy.box` in
+    /// production and `https://api.curvy.dev` for staging; the client appends `/sync`. Required
+    /// when [`Self::note_source`] is [`CurvyNoteSource::CurvyIndexer`], and without a default for
+    /// the same reason as [`Self::relayer_url`]. Overridden by [`INDEXER_URL_ENV`].
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde(default)]
+    pub curvy_indexer_url: Option<Url>,
 
     /// The Safe MultiSend the node's permission module delegate-calls for a bundled transaction.
     ///
@@ -659,17 +721,67 @@ where
     )
 }
 
+/// How long one request to Curvy's indexer may take.
+pub(super) const INDEXER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The production note index: whichever [`CurvyNoteSource`] the config selected.
+pub enum NoteIndex {
+    Blokli(BlokliIndex<BlokliClient>),
+    CurvyIndexer(indexer::CurvyIndexerSource),
+}
+
+#[async_trait::async_trait]
+impl CurvyIndexSource for NoteIndex {
+    async fn pending_notes(
+        &self,
+        after: Option<blokli_client::api::types::CurvyEventCursor>,
+        first: u32,
+    ) -> Result<Vec<blokli_client::api::types::CurvyPendingNote>, String> {
+        match self {
+            Self::Blokli(index) => index.pending_notes(after, first).await,
+            Self::CurvyIndexer(index) => index.pending_notes(after, first).await,
+        }
+    }
+
+    async fn committed_notes(
+        &self,
+        after: Option<blokli_client::api::types::CurvyEventCursor>,
+        first: u32,
+    ) -> Result<Vec<blokli_client::api::types::CurvyCommittedNote>, String> {
+        match self {
+            Self::Blokli(index) => index.committed_notes(after, first).await,
+            Self::CurvyIndexer(index) => index.committed_notes(after, first).await,
+        }
+    }
+
+    async fn indexed_head(&self) -> Result<(u64, u64), String> {
+        match self {
+            Self::Blokli(index) => index.indexed_head().await,
+            Self::CurvyIndexer(index) => index.indexed_head().await,
+        }
+    }
+
+    async fn nullifier_spent(&self, nullifier: String) -> Result<bool, String> {
+        match self {
+            Self::Blokli(index) => index.nullifier_spent(nullifier).await,
+            Self::CurvyIndexer(index) => index.nullifier_spent(nullifier).await,
+        }
+    }
+
+    async fn note_known(&self, note_id: String) -> Result<bool, String> {
+        match self {
+            Self::Blokli(index) => index.note_known(note_id).await,
+            Self::CurvyIndexer(index) => index.note_known(note_id).await,
+        }
+    }
+}
+
 /// A [`DepositPool`] settling through the Curvy shielded pool. See the module documentation.
 ///
 /// Deliberately **not** [`Clone`]: the discovery task is aborted on drop, and a clone that goes
 /// out of scope would take it down under the pool still in use. The strategy builder wraps it in
 /// an [`Arc`] instead.
-pub struct CurvyDepositPool<
-    N,
-    I = BlokliIndex<BlokliClient>,
-    A = RsSdkCurvyAdapter<BlokliClient>,
-    S = RedbCurvyDepositState,
-> {
+pub struct CurvyDepositPool<N, I = NoteIndex, A = RsSdkCurvyAdapter<BlokliClient>, S = RedbCurvyDepositState> {
     node: Arc<N>,
     index: Arc<I>,
     adapter: Arc<A>,
@@ -706,6 +818,14 @@ where
         if let Ok(raw) = std::env::var(RELAYER_URL_ENV) {
             cfg.relayer_url = Some(Url::parse(&raw).map_err(|error| {
                 StrategyError::InvalidConfiguration(format!("{RELAYER_URL_ENV} must be a URL: {error}"))
+            })?);
+        }
+        if let Ok(raw) = std::env::var(NOTE_SOURCE_ENV) {
+            cfg.note_source = raw.parse()?;
+        }
+        if let Ok(raw) = std::env::var(INDEXER_URL_ENV) {
+            cfg.curvy_indexer_url = Some(Url::parse(&raw).map_err(|error| {
+                StrategyError::InvalidConfiguration(format!("{INDEXER_URL_ENV} must be a URL: {error}"))
             })?);
         }
         if let Ok(raw) = std::env::var(TOKEN_ENV) {
@@ -745,11 +865,9 @@ where
         let adapter = RsSdkCurvyAdapter::new(
             Arc::clone(&blokli),
             cfg.blokli_url.to_string(),
-            RsSdkCurvyAdapterConfig::new(operator_key, cfg.token).with_modes(
-                cfg.shielding,
-                cfg.submission,
-                cfg.relayer_url.clone(),
-            ),
+            RsSdkCurvyAdapterConfig::new(operator_key, cfg.token)
+                .with_modes(cfg.shielding, cfg.submission, cfg.relayer_url.clone())
+                .with_note_source(cfg.note_source, cfg.curvy_indexer_url.clone()),
             safe_funder(node.chain_api().clone()),
             match cfg.shielding {
                 // The node's own chain key, because the module's `nodeOnly` check accepts no
@@ -783,14 +901,32 @@ where
             shielding = ?cfg.shielding,
             submission = ?cfg.submission,
             relayer = cfg.relayer_url.as_ref().map(|url| url.to_string()),
+            note_source = ?cfg.note_source,
+            curvy_indexer = cfg.curvy_indexer_url.as_ref().map(|url| url.to_string()),
             "Curvy PIX deposit pool ready"
         );
+        let index = match cfg.note_source {
+            CurvyNoteSource::Blokli => NoteIndex::Blokli(BlokliIndex(Arc::clone(&blokli))),
+            CurvyNoteSource::CurvyIndexer => {
+                let url = cfg
+                    .curvy_indexer_url
+                    .clone()
+                    .expect("validated: `curvy_indexer_url` is required for the Curvy indexer");
+                let api = indexer::HttpSyncApi::new(url, INDEXER_REQUEST_TIMEOUT)
+                    .map_err(|error| StrategyError::other(anyhow::anyhow!(error)))?;
+                // The chain id comes from the same Blokli the pool discovers the deployment through.
+                let chain = Arc::new(indexer::BlokliChainId::new(Arc::clone(&blokli)));
+                NoteIndex::CurvyIndexer(indexer::CurvyIndexerSource(indexer::CurvyIndexerClient::new(
+                    api, chain,
+                )))
+            }
+        };
         let detector = RsCoreCurvyNoteDetector::for_token(cfg.token);
         Ok(Self::with_parts(
             node,
             cfg,
             initial_funding,
-            BlokliIndex(blokli),
+            index,
             adapter,
             detector,
             state,
