@@ -39,15 +39,15 @@ discoverable only by a per-SSA scan identity the Exit mints, and recovered depos
 
 It offers two independent choices, because the Curvy relayer never handles deposits — a shield is a self-signed transaction either way:
 
-| setting | default | alternative |
-| ------- | ------- | ----------- |
-| `shielding` | `direct` — the node's Safe calls `directShield`, with no entry portal | `portal` — fund a deterministic entry portal, then deploy and shield it |
-| `submission` | `relayer` — hand proofs to Curvy's off-chain relayer | `operator` — sign and submit them from this node |
+| setting      | default                                                               | alternative                                                             |
+| ------------ | --------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `shielding`  | `direct` — the node's Safe calls `directShield`, with no entry portal | `portal` — fund a deterministic entry portal, then deploy and shield it |
+| `submission` | `relayer` — hand proofs to Curvy's off-chain relayer                  | `operator` — sign and submit them from this node                        |
 
-Both defaults describe a production deployment; a cluster without Curvy's off-chain services runs `submission: operator`.
-A **direct shield never takes the float out of the Safe**: the vault pulls from whoever calls `directShield`, so the Safe itself makes that
-call through its permission module. That needs a one-time grant per Safe — `scripts/scope-curvy-aggregator.sh` prints the transaction — and
-the node's own chain key to sign the module call.
+Both defaults describe a production deployment; a cluster without Curvy's off-chain services runs `submission: operator`. A **direct shield
+never takes the float out of the Safe**: the vault pulls from whoever calls `directShield`, so the Safe itself makes that call through its
+permission module. That needs a one-time grant per Safe — `scripts/scope-curvy-aggregator.sh` prints the transaction — and the node's own
+chain key to sign the module call.
 
 At runtime it needs a Blokli endpoint that exposes the Curvy deployment, the Curvy Groth16 proving artifacts (`CURVY_ZK_KEYS_DIR`: the five
 zkeys and five witness graphs published with each [`rs-sdk` release](https://github.com/0xCurvy/rs-sdk/releases), digest-checked on load),

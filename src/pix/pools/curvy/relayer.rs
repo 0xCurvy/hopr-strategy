@@ -118,10 +118,9 @@ impl PaymasterInfo {
         let units: u128 = self.submit_aggregation_gas_units.parse().map_err(|error| {
             StrategyError::other(anyhow::anyhow!("relayer quoted an unparseable gas unit count: {error}"))
         })?;
-        let price: u128 = self
-            .gas_price_wei
-            .parse()
-            .map_err(|error| StrategyError::other(anyhow::anyhow!("relayer quoted an unparseable gas price: {error}")))?;
+        let price: u128 = self.gas_price_wei.parse().map_err(|error| {
+            StrategyError::other(anyhow::anyhow!("relayer quoted an unparseable gas price: {error}"))
+        })?;
         let base = units
             .checked_mul(price)
             .ok_or_else(|| StrategyError::other(anyhow::anyhow!("the relayer's gas quote overflows")))?;
@@ -175,9 +174,9 @@ impl RelayClient {
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, RelayError> {
-        self.base_url
-            .join(path)
-            .map_err(|error| RelayError::Transport(format!("{path} is not a valid path under the relayer URL: {error}")))
+        self.base_url.join(path).map_err(|error| {
+            RelayError::Transport(format!("{path} is not a valid path under the relayer URL: {error}"))
+        })
     }
 
     /// The operator's identity and gas quote, for building an aggregation's fee note.
@@ -431,9 +430,8 @@ mod tests {
 
     #[test]
     fn statuses_parse_from_the_relayers_spelling() -> anyhow::Result<()> {
-        let submission: RelaySubmission = serde_json::from_str(
-            r#"{"requestId":"abc","status":"included","transactionHash":"0xdeadbeef"}"#,
-        )?;
+        let submission: RelaySubmission =
+            serde_json::from_str(r#"{"requestId":"abc","status":"included","transactionHash":"0xdeadbeef"}"#)?;
         assert_eq!(submission.status, RelayStatus::Included);
         assert_eq!(submission.request_id, "abc");
         Ok(())
@@ -454,7 +452,10 @@ mod tests {
                 "acceptedVaultTokenIds":["3"],"submitAggregationGasUnits":"675000",
                 "gasPriceWei":"1000000000","clientBufferBps":1500,"relayerToleranceBps":500}"#,
         )?;
-        assert_eq!(info.accepted_vault_token_ids.as_deref(), Some(["3".to_owned()].as_slice()));
+        assert_eq!(
+            info.accepted_vault_token_ids.as_deref(),
+            Some(["3".to_owned()].as_slice())
+        );
         assert_eq!(info.operator.bjj_public_key, "0x3");
         Ok(())
     }

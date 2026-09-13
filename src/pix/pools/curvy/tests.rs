@@ -1015,8 +1015,7 @@ fn a_file_an_override_can_fix_still_parses_and_validates() -> anyhow::Result<()>
     // `HOPRD_CURVY_SUBMISSION` at startup. `hoprd` validates the file as it parses it, long
     // before the pool applies its overrides, so deserialising plus `Validate` must NOT reject
     // this. Enforcing the cross-field rule there is what made a valid deployment unstartable.
-    let cfg: CurvyDepositPoolConfig =
-        serde_json::from_str(r#"{"blokli_url":"http://127.0.0.1:8080/"}"#)?;
+    let cfg: CurvyDepositPoolConfig = serde_json::from_str(r#"{"blokli_url":"http://127.0.0.1:8080/"}"#)?;
     assert_eq!(cfg.submission, CurvySubmission::Relayer, "the default is unchanged");
     assert!(cfg.relayer_url.is_none());
     StrategyError::validate_config(&cfg)

@@ -55,18 +55,42 @@ SELF_TEST=0
 # `scopeTargetToken(uint256)` — keccak256 of the signature, first four bytes.
 SCOPE_SELECTOR="a76c9a2f"
 
-die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --module)     MODULE="${2:-}"; shift 2 ;;
-    --aggregator) AGGREGATOR="${2:-}"; shift 2 ;;
-    --safe)       SAFE="${2:-}"; shift 2 ;;
-    --rpc-url)    RPC_URL="${2:-}"; shift 2 ;;
-    --owner-key)  OWNER_KEY="${2:-}"; shift 2 ;;
-    --self-test)  SELF_TEST=1; shift ;;
-    -h|--help)    sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//;$d'; exit 0 ;;
-    *)            die "unknown argument $1" ;;
+  --module)
+    MODULE="${2:-}"
+    shift 2
+    ;;
+  --aggregator)
+    AGGREGATOR="${2:-}"
+    shift 2
+    ;;
+  --safe)
+    SAFE="${2:-}"
+    shift 2
+    ;;
+  --rpc-url)
+    RPC_URL="${2:-}"
+    shift 2
+    ;;
+  --owner-key)
+    OWNER_KEY="${2:-}"
+    shift 2
+    ;;
+  --self-test)
+    SELF_TEST=1
+    shift
+    ;;
+  -h | --help)
+    sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//;$d'
+    exit 0
+    ;;
+  *) die "unknown argument $1" ;;
   esac
 done
 

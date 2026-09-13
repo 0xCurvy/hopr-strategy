@@ -63,8 +63,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     CommittedCurvyNote, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome, Url,
-    relayer::RelayClient,
     detect::{bjj_point, scan_public_key_dec},
+    relayer::RelayClient,
     state::{RedbCurvyDepositState, id_bytes},
 };
 
@@ -93,9 +93,8 @@ pub type PortalFunder = Arc<dyn Fn(Address, HoprBalance) -> BoxFuture<'static, R
 ///
 /// Arguments: the `directShield` calldata, the token, the vault to approve, the aggregator to
 /// call, and the gross amount to approve.
-pub type DirectShielder = Arc<
-    dyn Fn(Vec<u8>, Address, Address, Address, u128) -> BoxFuture<'static, Result<(), String>> + Send + Sync,
->;
+pub type DirectShielder =
+    Arc<dyn Fn(Vec<u8>, Address, Address, Address, u128) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
 
 /// Curvy chain operations that require SDK knowledge.
 ///
@@ -183,7 +182,12 @@ impl RsSdkCurvyAdapterConfig {
     }
 
     /// Applies the pool's configured modes.
-    pub fn with_modes(mut self, shielding: CurvyShielding, submission: CurvySubmission, relayer_url: Option<Url>) -> Self {
+    pub fn with_modes(
+        mut self,
+        shielding: CurvyShielding,
+        submission: CurvySubmission,
+        relayer_url: Option<Url>,
+    ) -> Self {
         self.shielding = shielding;
         self.submission = submission;
         self.relayer_url = relayer_url;
@@ -513,12 +517,7 @@ impl CurvyChainEndpoints {
         // A named-but-zero address is how a portal-less deployment states "no factory", so it
         // is folded into the same `None` as an absent key rather than being carried as a
         // plausible-looking address that every call to it would silently fail against.
-        let optional_contract = |name: &str| {
-            contracts
-                .get(name)
-                .filter(|address| !is_zero_address(address))
-                .cloned()
-        };
+        let optional_contract = |name: &str| contracts.get(name).filter(|address| !is_zero_address(address)).cloned();
         Ok(Self {
             aggregator: contract("curvy_aggregator")?,
             portal_factory: optional_contract("curvy_portal_factory"),
@@ -544,8 +543,8 @@ impl CurvyChainEndpoints {
     pub fn require_portal_factory(&self) -> Result<&str, RsSdkCurvyAdapterError> {
         self.portal_factory.as_deref().ok_or_else(|| {
             RsSdkCurvyAdapterError::Discovery(
-                "this Curvy deployment has no entry-portal factory, so `shielding: portal` cannot \
-                 work against it; use `shielding: direct`"
+                "this Curvy deployment has no entry-portal factory, so `shielding: portal` cannot work against it; \
+                 use `shielding: direct`"
                     .to_owned(),
             )
         })
@@ -726,9 +725,8 @@ where
                 .map_err(|error| {
                     RsSdkCurvyAdapterError::Funding(format!(
                         "{error}\n\nA direct shield reverts until the node's Safe is allowed to call the Curvy \
-                         aggregator ({aggregator}). Grant it once per Safe with \
-                         `scripts/scope-curvy-aggregator.sh`, or check that the deployment has \
-                         `directShieldEnabled` set."
+                         aggregator ({aggregator}). Grant it once per Safe with `scripts/scope-curvy-aggregator.sh`, \
+                         or check that the deployment has `directShieldEnabled` set."
                     ))
                 })?;
         }
@@ -987,22 +985,16 @@ where
         })?;
         // `"x.y"`, decimal — the same spelling `Identity` uses for its meta-keys and the relayer
         // for its operator's owner key.
-        let (x, y) = info
-            .operator
-            .bjj_public_key
-            .split_once('.')
-            .ok_or_else(|| {
-                RsSdkCurvyAdapterError::InvalidValue(format!(
-                    "the relayer's operator key {:?} is not an `x.y` point",
-                    info.operator.bjj_public_key
-                ))
-            })?;
+        let (x, y) = info.operator.bjj_public_key.split_once('.').ok_or_else(|| {
+            RsSdkCurvyAdapterError::InvalidValue(format!(
+                "the relayer's operator key {:?} is not an `x.y` point",
+                info.operator.bjj_public_key
+            ))
+        })?;
         let coordinate = |value: &str, name: &str| {
-            Bn254Fr::try_from_dec(value)
-                .map(Bn254Fr::into_inner)
-                .map_err(|error| {
-                    RsSdkCurvyAdapterError::InvalidValue(format!("the relayer's operator key {name}: {error}"))
-                })
+            Bn254Fr::try_from_dec(value).map(Bn254Fr::into_inner).map_err(|error| {
+                RsSdkCurvyAdapterError::InvalidValue(format!("the relayer's operator key {name}: {error}"))
+            })
         };
         let identity = Identity {
             big_k: info.operator.spend_public_key,
@@ -1236,9 +1228,11 @@ where
                             Err(error) => Err(anyhow::anyhow!("{error}")),
                         }
                     }
-                    _ => client
-                        .submit_pix_aggregation(request, &self.config.operator_private_key, self.config.route)
-                        .await,
+                    _ => {
+                        client
+                            .submit_pix_aggregation(request, &self.config.operator_private_key, self.config.route)
+                            .await
+                    }
                 },
                 Err(error) => Err(error),
             };
@@ -1391,7 +1385,11 @@ where
                         &request.spend_key,
                     )
                     .await?;
-                    tracing::info!(notes = chunk.len(), amount = request.delivered, "relayed a Curvy PIX withdrawal");
+                    tracing::info!(
+                        notes = chunk.len(),
+                        amount = request.delivered,
+                        "relayed a Curvy PIX withdrawal"
+                    );
                     request.delivered
                 }
                 (CurvySubmission::Relayer, None) => {

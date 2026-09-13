@@ -64,13 +64,13 @@
 //! * A **Blokli endpoint** ([`CurvyDepositPoolConfig::blokli_url`]) whose `chain_info` names the Curvy deployment
 //!   (`curvy_aggregator`, `curvy_vault`, `token`, and `curvy_portal_factory` where one exists) and that indexes Curvy
 //!   notes. Reads go through it, and so do submissions under `submission: operator`.
-//! * A **relayer endpoint** ([`CurvyDepositPoolConfig::relayer_url`]) under `submission: relayer` —
-//!   `https://api.curvy.box` in production, `https://api.curvy.dev` for staging. No default: pointing a misconfigured
-//!   node at a production relayer is worse than refusing to start.
-//! * The **Curvy operator key**, from the environment variable named by
-//!   [`CurvyDepositPoolConfig::operator_key_env`] — **only under `submission: operator`**, where it signs and pays for
-//!   allocations, withdrawals and note commitments. A relayed node needs no EVM key of its own: the relayer submits,
-//!   the batch-prover commits, and the shield is signed by the node's existing chain key.
+//! * A **relayer endpoint** ([`CurvyDepositPoolConfig::relayer_url`]) under `submission: relayer` — `https://api.curvy.box`
+//!   in production, `https://api.curvy.dev` for staging. No default: pointing a misconfigured node at a production
+//!   relayer is worse than refusing to start.
+//! * The **Curvy operator key**, from the environment variable named by [`CurvyDepositPoolConfig::operator_key_env`] —
+//!   **only under `submission: operator`**, where it signs and pays for allocations, withdrawals and note commitments.
+//!   A relayed node needs no EVM key of its own: the relayer submits, the batch-prover commits, and the shield is
+//!   signed by the node's existing chain key.
 //! * The Curvy **proving artifacts**: every allocation, commitment and withdrawal is a Groth16 proof made in-process,
 //!   and the SDK loads each circuit's zkey and witness graph from `CURVY_ZK_KEYS_DIR` (flat, one zkey and one
 //!   `*.signet.zst` graph per circuit, digest-checked; a `CURVY_*_ZKEY` / `CURVY_*_GRAPH` pair per circuit overrides
@@ -313,8 +313,8 @@ fn default_safe_multisend_address() -> Address {
 fn validate_mode_requirements(cfg: &CurvyDepositPoolConfig) -> Result<(), StrategyError> {
     if cfg.submission == CurvySubmission::Relayer && cfg.relayer_url.is_none() {
         return Err(StrategyError::InvalidConfiguration(format!(
-            "`submission: relayer` needs `relayer_url`; set it, or select `submission: operator` \
-             (or {SUBMISSION_ENV}=operator) to sign and submit from this node"
+            "`submission: relayer` needs `relayer_url`; set it, or select `submission: operator` (or \
+             {SUBMISSION_ENV}=operator) to sign and submit from this node"
         )));
     }
     Ok(())
@@ -703,8 +703,7 @@ where
         let operator_key = match cfg.submission {
             CurvySubmission::Operator => std::env::var(&cfg.operator_key_env).map_err(|_| {
                 StrategyError::InvalidConfiguration(format!(
-                    "environment variable {} must hold the Curvy operator's private key when submission is \
-                     `operator`",
+                    "environment variable {} must hold the Curvy operator's private key when submission is `operator`",
                     cfg.operator_key_env
                 ))
             })?,

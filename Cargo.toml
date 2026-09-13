@@ -65,9 +65,9 @@ strategy-pix-curvy = [
   "dep:const-hex",
   "dep:curvy-abi",
   "dep:curvy-chain-blokli",
-  "dep:reqwest",
   "dep:curvy-core",
   "dep:curvy-sdk",
+  "dep:reqwest",
   "dep:serde_json",
   "dep:zeroize",
   "hopr-api/types-curvy",
@@ -127,19 +127,19 @@ scrypt = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 
 # Curvy deposit pool — enabled via the `strategy-pix-curvy` feature.
-babyjubjub-ec      = { workspace = true, optional = true }
-const-hex          = { workspace = true, optional = true }
-curvy-abi          = { workspace = true, optional = true }
+babyjubjub-ec = { workspace = true, optional = true }
+const-hex     = { workspace = true, optional = true }
+curvy-abi     = { workspace = true, optional = true }
 # The relayer's HTTP surface. Already in the graph via `blokli-client` and `alloy`, so this
 # declares a dependency rather than adding one.
+curvy-chain-blokli = { workspace = true, optional = true }
+curvy-core = { workspace = true, optional = true }
+curvy-sdk = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true, default-features = false, features = [
   "json",
   "rustls",
 ] }
-curvy-chain-blokli = { workspace = true, optional = true }
-curvy-core         = { workspace = true, optional = true }
-curvy-sdk          = { workspace = true, optional = true }
-zeroize            = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-broadcast = { workspace = true }
@@ -233,13 +233,13 @@ zeroize              = "1.8.1"
 # visibly), so patching one and leaving its siblings on crates.io puts two versions of the same
 # trait in the graph and nothing implements the one that matters.
 [patch.crates-io]
-curvy-abi = { path = "../rs-sdk/curvy-abi" }
-curvy-chain-api = { path = "../rs-sdk/curvy-chain-api" }
+curvy-abi          = { path = "../rs-sdk/curvy-abi" }
+curvy-chain-api    = { path = "../rs-sdk/curvy-chain-api" }
 curvy-chain-blokli = { path = "../rs-sdk/curvy-chain-blokli" }
-curvy-chain-rpc = { path = "../rs-sdk/curvy-chain-rpc" }
-curvy-sdk = { path = "../rs-sdk/curvy-sdk" }
-curvy-types = { path = "../rs-sdk/curvy-types" }
-curvy-witnesscalc = { path = "../rs-sdk/curvy-witnesscalc" }
+curvy-chain-rpc    = { path = "../rs-sdk/curvy-chain-rpc" }
+curvy-sdk          = { path = "../rs-sdk/curvy-sdk" }
+curvy-types        = { path = "../rs-sdk/curvy-types" }
+curvy-witnesscalc  = { path = "../rs-sdk/curvy-witnesscalc" }
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]

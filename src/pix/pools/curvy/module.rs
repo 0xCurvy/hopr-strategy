@@ -17,8 +17,8 @@
 //! inner call is checked against the module's target set:
 //!
 //! * the target must be **scoped**, or the call reverts `NonExistentKey()`. wxHOPR already is; the Curvy aggregator has
-//!   to be added once per Safe with `scopeTargetToken`, which accepts any address and, at `TargetPermission::ALLOW_ALL`,
-//!   any selector.
+//!   to be added once per Safe with `scopeTargetToken`, which accepts any address and, at
+//!   `TargetPermission::ALLOW_ALL`, any selector.
 //! * `value` must be zero unless the target is a `SEND` target, so this only ever moves ERC-20 value.
 //! * `DelegateCall` is rejected unless the target is exactly the module's configured MultiSend — which is why
 //!   [`CurvyDepositPoolConfig::safe_multisend_address`](super::CurvyDepositPoolConfig::safe_multisend_address) is
@@ -346,10 +346,7 @@ mod tests {
     fn the_bundle_blob_matches_the_reference_encoding() {
         let mut shield = vec![0xde, 0xad, 0xbe, 0xef];
         shield.extend_from_slice(&word(7));
-        let blob = encode_multi_send(&[
-            (addr(0xaa), encode_approve(&addr(0xbb), 1000)),
-            (addr(0xcc), shield),
-        ]);
+        let blob = encode_multi_send(&[(addr(0xaa), encode_approve(&addr(0xbb), 1000)), (addr(0xcc), shield)]);
         assert_eq!(
             hex(&blob),
             "8d80ff0a\
