@@ -197,6 +197,14 @@ pub const SUBMISSION_ENV: &str = "HOPRD_CURVY_SUBMISSION";
 /// Environment variable that overrides [`CurvyDepositPoolConfig::relayer_url`].
 pub const RELAYER_URL_ENV: &str = "HOPRD_CURVY_RELAYER_URL";
 
+/// Environment variable that overrides [`CurvyDepositPoolConfig::token`].
+///
+/// The vault token id is deployment-specific — 3 on Blokli's local chain, 2 on Gnosis — and,
+/// like the other overrides here, it is unreachable as a YAML key from a harness that writes the
+/// plain pool's config type. Getting it wrong is silent (see the field docs), so a cluster run
+/// against a real deployment must be able to state it.
+pub const TOKEN_ENV: &str = "HOPRD_CURVY_TOKEN";
+
 /// How the pool moves the node's float into the shielded vault.
 ///
 /// Independent of [`CurvySubmission`]: the Curvy relayer never handles deposits, so a shield is a
@@ -699,6 +707,11 @@ where
             cfg.relayer_url = Some(Url::parse(&raw).map_err(|error| {
                 StrategyError::InvalidConfiguration(format!("{RELAYER_URL_ENV} must be a URL: {error}"))
             })?);
+        }
+        if let Ok(raw) = std::env::var(TOKEN_ENV) {
+            cfg.token = raw.trim().parse().map_err(|error| {
+                StrategyError::InvalidConfiguration(format!("{TOKEN_ENV} must be a vault token id: {error}"))
+            })?;
         }
         StrategyError::validate_config(&cfg)?;
         // After the overrides, so an env-selected mode is judged rather than the file's default.
