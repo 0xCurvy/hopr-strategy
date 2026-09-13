@@ -414,32 +414,28 @@ where
     let mut committed_after = tracker
         .catch_up_cursor(CurvyEventKind::Committed, replay_history)
         .map_err(|error| error.to_string())?;
-    // Notes committed before this watcher ever saw them pending get their discovery here, from
-    // the cursor the completion pass below starts at, so no committed note passes that cursor
-    // undetected. Recording a candidate twice is harmless.
-    let mut candidate_after = committed_after.clone();
-    loop {
-        let page = client
-            .committed_candidates(candidate_after.clone(), QUERY_PAGE_SIZE)
-            .await?;
-        let page_len = page.len();
-        for candidate in page {
-            candidate_after = Some(CurvyEventCursor::from(&candidate.position));
-            if !tracker
-                .process_candidate(candidate)
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                return Ok(());
-            }
-        }
-        if page_len < QUERY_PAGE_SIZE as usize {
-            break;
-        }
-    }
     loop {
         let page = client.committed_notes(committed_after.clone(), QUERY_PAGE_SIZE).await?;
         let page_len = page.len();
+        // Notes committed before this watcher ever saw them pending get their discovery here,
+        // over the very leaves this page completes, before the cursor moves past them. The
+        // candidates are read after the page and bounded to it, so a checkpoint advancing
+        // between the two reads can only widen the candidates, never leave a completed leaf
+        // unscanned. Recording a candidate twice is harmless.
+        if page_len > 0 {
+            let candidates = client
+                .committed_candidates(committed_after.clone(), page_len as u32)
+                .await?;
+            for candidate in candidates {
+                if !tracker
+                    .process_candidate(candidate)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    return Ok(());
+                }
+            }
+        }
         let mut reached_unfinalized = false;
         for note in page {
             let event_block =
