@@ -2704,7 +2704,7 @@ dependencies = [
 [[package]]
 name = "curvy-abi"
 version = "0.1.0-rc.6"
-source = "git+https://github.com/0xCurvy/rs-sdk?rev=ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52#ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52"
+source = "git+https://github.com/0xCurvy/rs-sdk?rev=b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312#b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312"
 dependencies = [
  "alloy 1.8.3",
  "anyhow",
@@ -2716,7 +2716,7 @@ dependencies = [
 [[package]]
 name = "curvy-chain-api"
 version = "0.1.0-rc.6"
-source = "git+https://github.com/0xCurvy/rs-sdk?rev=ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52#ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52"
+source = "git+https://github.com/0xCurvy/rs-sdk?rev=b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312#b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312"
 dependencies = [
  "async-trait",
  "curvy-types",
@@ -2726,7 +2726,7 @@ dependencies = [
 [[package]]
 name = "curvy-chain-blokli"
 version = "0.1.0-rc.6"
-source = "git+https://github.com/0xCurvy/rs-sdk?rev=ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52#ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52"
+source = "git+https://github.com/0xCurvy/rs-sdk?rev=b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312#b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312"
 dependencies = [
  "async-trait",
  "curvy-chain-api",
@@ -2784,7 +2784,7 @@ dependencies = [
 [[package]]
 name = "curvy-sdk"
 version = "0.1.0-rc.6"
-source = "git+https://github.com/0xCurvy/rs-sdk?rev=ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52#ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52"
+source = "git+https://github.com/0xCurvy/rs-sdk?rev=b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312#b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312"
 dependencies = [
  "anyhow",
  "ark-bn254 0.6.0",
@@ -2804,7 +2804,7 @@ dependencies = [
 [[package]]
 name = "curvy-types"
 version = "0.1.0-rc.6"
-source = "git+https://github.com/0xCurvy/rs-sdk?rev=ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52#ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52"
+source = "git+https://github.com/0xCurvy/rs-sdk?rev=b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312#b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312"
 dependencies = [
  "serde",
 ]
@@ -2827,7 +2827,7 @@ dependencies = [
 [[package]]
 name = "curvy-witnesscalc"
 version = "0.1.0-rc.6"
-source = "git+https://github.com/0xCurvy/rs-sdk?rev=ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52#ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52"
+source = "git+https://github.com/0xCurvy/rs-sdk?rev=b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312#b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312"
 dependencies = [
  "anyhow",
  "ark-bn254 0.6.0",
@@ -8211,4 +8211,4 @@ dependencies = [
 [[patch.unused]]
 name = "curvy-chain-rpc"
 version = "0.1.0-rc.6"
-source = "git+https://github.com/0xCurvy/rs-sdk?rev=ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52#ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52"
+source = "git+https://github.com/0xCurvy/rs-sdk?rev=b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312#b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312"

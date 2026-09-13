@@ -242,13 +242,13 @@ zeroize              = "1.8.1"
 # trait in the graph and nothing implements the one that matters. `curvy-chain-rpc` is not in this
 # crate's graph and cargo says so; it stays listed to keep the set whole for the day it is.
 [patch.crates-io]
-curvy-abi          = { git = "https://github.com/0xCurvy/rs-sdk", rev = "ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52" }
-curvy-chain-api    = { git = "https://github.com/0xCurvy/rs-sdk", rev = "ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52" }
-curvy-chain-blokli = { git = "https://github.com/0xCurvy/rs-sdk", rev = "ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52" }
-curvy-chain-rpc    = { git = "https://github.com/0xCurvy/rs-sdk", rev = "ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52" }
-curvy-sdk          = { git = "https://github.com/0xCurvy/rs-sdk", rev = "ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52" }
-curvy-types        = { git = "https://github.com/0xCurvy/rs-sdk", rev = "ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52" }
-curvy-witnesscalc  = { git = "https://github.com/0xCurvy/rs-sdk", rev = "ab1e214d55a3e9d30790fd0ba38a3bb3bf110e52" }
+curvy-abi          = { git = "https://github.com/0xCurvy/rs-sdk", rev = "b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312" }
+curvy-chain-api    = { git = "https://github.com/0xCurvy/rs-sdk", rev = "b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312" }
+curvy-chain-blokli = { git = "https://github.com/0xCurvy/rs-sdk", rev = "b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312" }
+curvy-chain-rpc    = { git = "https://github.com/0xCurvy/rs-sdk", rev = "b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312" }
+curvy-sdk          = { git = "https://github.com/0xCurvy/rs-sdk", rev = "b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312" }
+curvy-types        = { git = "https://github.com/0xCurvy/rs-sdk", rev = "b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312" }
+curvy-witnesscalc  = { git = "https://github.com/0xCurvy/rs-sdk", rev = "b59f36f2ebdc175d9e3edeeaae9e0bfdd9e9f312" }
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]
