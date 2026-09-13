@@ -360,6 +360,13 @@ pub struct CurvyDepositPoolConfig {
     /// **A real deployment almost certainly needs another value.** Ids are assigned sequentially
     /// by `CurvyVaultV2.registerToken`, starting at 2 because id 1 is the vault's pre-seeded
     /// native currency — so on Gnosis, where wxHOPR is the first registered ERC-20, it is **2**.
+    ///
+    /// That is read off the deployed Gnosis contracts rather than inferred: `initialize` seeds
+    /// `_numberOfTokens = 1` for the native currency, `registerToken` pre-increments before it
+    /// assigns, and the staging and production Gnosis deployments each register exactly one
+    /// ERC-20 — `0xD4fdec44DB9D44B8f2b6d529620f9C0C7066A2c1`, the sole entry under `gnosis` in the
+    /// contracts repo's network parameters. Gnosis is **2**, and the default of 3 is wrong there.
+    ///
     /// Getting this wrong does not fail loudly: the pool would allocate against whatever token
     /// that id names. Read it back with Blokli's `curvyVaultToken` before deploying.
     #[default(default_token())]
