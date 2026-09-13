@@ -1222,6 +1222,166 @@ fn the_note_source_defaults_to_blokli_and_the_indexer_needs_its_url() -> anyhow:
 }
 
 /// Against Curvy's staging indexer for Gnosis. Network; run by hand:
+/// The whole pool over a demo run's Exit state against Curvy staging: registering the watch
+/// must discover and complete the allocation's committed note.
+#[test_log::test(tokio::test)]
+#[ignore = "talks to https://api.curvy.dev and needs a demo state file"]
+async fn replay_pool_watch_against_staging() -> anyhow::Result<()> {
+    use super::indexer::{CurvyIndexerClient, CurvyIndexerSource, HttpSyncApi};
+    let state_path = std::env::var("EXIT_STATE")?;
+    let pseudonym = const_hex::decode(std::env::var("PIX_PSEUDONYM")?)?;
+    let index: u32 = std::env::var("PIX_INDEX")?.parse()?;
+    let owner_bytes = const_hex::decode(std::env::var("PIX_OWNER")?)?;
+    let owner = BjjPublicKey::try_from(owner_bytes.as_slice())?;
+    let bytes: [u8; 10] = pseudonym.as_slice().try_into()?;
+    let id = PixAddressId::new(&HoprPseudonym::from(bytes), NonZeroU32::new(index).expect("non-zero"));
+    let state = RedbCurvyDepositState::open(state_path)?;
+    let node = test_node().await?;
+    let cfg = CurvyDepositPoolConfig {
+        max_deposit_tracking_time: Duration::from_secs(30),
+        token: 2,
+        ..Default::default()
+    };
+    let api =
+        HttpSyncApi::new("https://api.curvy.dev".parse()?, Duration::from_secs(30)).map_err(anyhow::Error::msg)?;
+    let pool = CurvyDepositPool::with_parts(
+        node,
+        cfg,
+        HoprBalance::new_base(100),
+        CurvyIndexerSource(CurvyIndexerClient::new(api, Arc::new(100u64))),
+        RecordingAdapter::consistent(),
+        RsCoreCurvyNoteDetector::for_token(2),
+        state,
+    );
+    let amount: HoprBalance = "21.523968 wxHOPR".parse()?;
+    let started = std::time::Instant::now();
+    let notification = pool.notify_deposit(id, owner, amount)?;
+    match tokio::time::timeout(Duration::from_secs(25), notification).await {
+        Ok(Ok((confirmed_id, _, confirmed))) => {
+            println!("COMPLETED {confirmed_id:?} {confirmed} after {:?}", started.elapsed())
+        }
+        Ok(Err(error)) => println!("NOTIFICATION ERROR {error}"),
+        Err(_) => println!("TIMED OUT after {:?}", started.elapsed()),
+    }
+    println!(
+        "cursors now: pending {:?} committed {:?}; committed amount {}",
+        pool.state()
+            .cursor(CurvyEventKind::Pending)?
+            .map(|c| c.event_item_index.0.clone()),
+        pool.state()
+            .cursor(CurvyEventKind::Committed)?
+            .map(|c| c.event_item_index.0.clone()),
+        pool.state().committed_amount(&id)?
+    );
+    Ok(())
+}
+
+/// Replays detection for a real allocation from a demo run against Curvy staging's committed
+/// rows: `EXIT_STATE=<redb> PIX_PSEUDONYM=<hex10> PIX_INDEX=<n> PIX_OWNER=<hex32>`.
+#[tokio::test]
+#[ignore = "talks to https://api.curvy.dev and needs a demo state file"]
+async fn replay_detection_against_staging() -> anyhow::Result<()> {
+    use super::indexer::{CurvyIndexerClient, CurvyIndexerSource, HttpSyncApi};
+    let state_path = std::env::var("EXIT_STATE")?;
+    let pseudonym = const_hex::decode(std::env::var("PIX_PSEUDONYM")?)?;
+    let index: u32 = std::env::var("PIX_INDEX")?.parse()?;
+    let owner_bytes = const_hex::decode(std::env::var("PIX_OWNER")?)?;
+    let owner = BjjPublicKey::try_from(owner_bytes.as_slice())?;
+    let bytes: [u8; 10] = pseudonym.as_slice().try_into()?;
+    let id = PixAddressId::new(&HoprPseudonym::from(bytes), NonZeroU32::new(index).expect("non-zero"));
+    let state = RedbCurvyDepositState::open(state_path)?;
+    println!(
+        "state cursors: pending {:?} committed {:?}",
+        state
+            .cursor(CurvyEventKind::Pending)?
+            .map(|c| (c.block.0.clone(), c.event_item_index.0.clone())),
+        state
+            .cursor(CurvyEventKind::Committed)?
+            .map(|c| (c.block.0.clone(), c.event_item_index.0.clone()))
+    );
+    let secret = state
+        .scan_secret(&id)?
+        .expect("the state holds this allocation's scan secret");
+    println!(
+        "allocation {id:?} owner {owner} secret present; owned notes in state: {:?}",
+        state.committed_notes(&id)?.len()
+    );
+    let detector = RsCoreCurvyNoteDetector::for_token(2);
+    let api =
+        HttpSyncApi::new("https://api.curvy.dev".parse()?, Duration::from_secs(30)).map_err(anyhow::Error::msg)?;
+    let source = CurvyIndexerSource(CurvyIndexerClient::new(api, Arc::new(100u64)));
+    let watched = vec![(id, owner, secret)];
+    let candidates = source
+        .committed_candidates(None, 1000)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    println!("{} committed candidates", candidates.len());
+    for candidate in &candidates {
+        match detector.detect_owned_note(candidate, &watched) {
+            Ok(Some(note)) => println!(
+                "  leaf {}: OWNED amount {:?}",
+                candidate.position.event_item_index.0, note.deposit.amount
+            ),
+            Ok(None) => {}
+            Err(error) => println!("  leaf {}: ERROR {error}", candidate.position.event_item_index.0),
+        }
+    }
+    let pending = source.pending_notes(None, 1000).await.map_err(anyhow::Error::msg)?;
+    println!("{} pending", pending.len());
+    for candidate in &pending {
+        if let Ok(Some(note)) = detector.detect_owned_note(candidate, &watched) {
+            println!(
+                "  pending {}: OWNED amount {:?}",
+                candidate.note_id.0, note.deposit.amount
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Runs the real watcher over Curvy staging's Gnosis rows for a few seconds with one watched
+/// allocation, so a silent watcher shows up here rather than in a demo run.
+/// `RUST_LOG=hopr_strategy=debug cargo test --all-features --lib staging_watcher -- --ignored --nocapture`.
+#[test_log::test(tokio::test)]
+#[ignore = "talks to https://api.curvy.dev"]
+async fn staging_watcher_catches_up_on_gnosis() -> anyhow::Result<()> {
+    use super::indexer::{CurvyIndexerClient, CurvyIndexerSource, HttpSyncApi};
+    let dir = tempfile::tempdir()?;
+    let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?;
+    let node = test_node().await?;
+    let cfg = CurvyDepositPoolConfig {
+        max_deposit_tracking_time: Duration::from_secs(20),
+        token: 2,
+        ..Default::default()
+    };
+    let api =
+        HttpSyncApi::new("https://api.curvy.dev".parse()?, Duration::from_secs(30)).map_err(anyhow::Error::msg)?;
+    let pool = CurvyDepositPool::with_parts(
+        node,
+        cfg,
+        HoprBalance::new_base(100),
+        CurvyIndexerSource(CurvyIndexerClient::new(api, Arc::new(100u64))),
+        RecordingAdapter::consistent(),
+        RsCoreCurvyNoteDetector::for_token(2),
+        state,
+    );
+    let id = pix_id(1);
+    let _data = pool.generate_deposit_data(&id).await?;
+    // Watching starts with the Exit's wait, not with the identity.
+    let notification = pool.notify_deposit(id, *BjjKeypair::random().public(), ten())?;
+    let started = std::time::Instant::now();
+    let _ = tokio::time::timeout(Duration::from_secs(8), notification).await;
+    println!(
+        "watched for {:?}; pending cursor {:?}; committed cursor {:?}",
+        started.elapsed(),
+        pool.state().cursor(CurvyEventKind::Pending)?.map(|c| c.block.0.clone()),
+        pool.state()
+            .cursor(CurvyEventKind::Committed)?
+            .map(|c| c.event_item_index.0.clone())
+    );
+    Ok(())
+}
+
 /// `cargo test --all-features --lib staging_indexer -- --ignored --nocapture`.
 #[tokio::test]
 #[ignore = "talks to https://api.curvy.dev"]
@@ -1236,6 +1396,22 @@ async fn staging_indexer_serves_gnosis_notes() -> anyhow::Result<()> {
     let pending = source.pending_notes(None, 10).await.map_err(anyhow::Error::msg)?;
     let committed = source.committed_notes(None, 10).await.map_err(anyhow::Error::msg)?;
     println!("pending {} committed {}", pending.len(), committed.len());
+    let candidates = source
+        .committed_candidates(None, 10)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    println!("committed candidates {}", candidates.len());
+    for candidate in candidates.iter().take(3) {
+        println!(
+            "  leaf {} view_tag {} amount {} token {} plaintext {} block {}",
+            candidate.position.event_item_index.0,
+            candidate.view_tag,
+            candidate.amount.0,
+            candidate.token_id.0,
+            candidate.is_plaintext,
+            candidate.position.block.0
+        );
+    }
     assert!(
         !source
             .nullifier_spent("0x01".to_owned())
