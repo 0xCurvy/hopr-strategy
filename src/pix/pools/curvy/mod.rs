@@ -1215,6 +1215,8 @@ fn is_transient_chain_read(message: &str) -> bool {
         || message.contains("Max retries exceeded")
         || message.contains("HTTP error 429")
         || message.contains("HTTP error 5")
+        // The gate re-priced gas between the quote and the proof; the next attempt re-quotes.
+        || message.contains("operator note does not cover the gas cost")
 }
 
 /// What an allocation attempt waits out within its budget: the committed tree catching up, or

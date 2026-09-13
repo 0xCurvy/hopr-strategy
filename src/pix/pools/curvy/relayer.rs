@@ -139,13 +139,23 @@ impl PaymasterInfo {
     /// native gas, converted at the two USD prices the way the relayer's `gasCostInToken` does
     /// (`ceil(native_wei * native_usd * 10^token_decimals / (10^native_decimals * token_usd))`),
     /// so the note clears the gate's threshold by the client buffer rather than by luck.
+    ///
+    /// Carries [`FEE_NOTE_HEADROOM_BPS`] on top of the operator's own buffer. The gate re-reads
+    /// the gas price and the prices when the proof arrives, tolerating only 5% of drift, while
+    /// the quote is minutes old by then: on Gnosis the gas price is single-digit wei and moves by
+    /// tens of percent between the two. The note is worth a fraction of a cent, and its excess
+    /// is the operator's, so erring far high is the cheap side of a re-proof.
     pub fn required_fee_in_token(
         &self,
         native: &TokenValuation,
         token: &TokenValuation,
     ) -> Result<u128, StrategyError> {
         let native_wei = self.required_fee()?;
-        convert_token_amount(native_wei, native, token)
+        let converted = convert_token_amount(native_wei, native, token)?;
+        converted
+            .checked_mul(10_000u128 + FEE_NOTE_HEADROOM_BPS as u128)
+            .map(|scaled| scaled.div_ceil(10_000))
+            .ok_or_else(|| StrategyError::other(anyhow::anyhow!("the fee note headroom overflows")))
     }
 }
 
@@ -196,6 +206,10 @@ impl NetworksEnvelope {
             .ok_or_else(|| RelayError::Rejected(format!("the gateway lists no network with chain id {chain_id}")))
     }
 }
+
+/// Headroom a relayer fee note carries over the converted quote, in basis points: doubled. See
+/// [`PaymasterInfo::required_fee_in_token`].
+pub const FEE_NOTE_HEADROOM_BPS: u64 = 10_000;
 
 /// Decimal places the relayer scales USD prices to before integer arithmetic (`PRICE_DECIMALS`).
 pub const PRICE_DECIMALS: u32 = 8;
@@ -645,22 +659,23 @@ mod tests {
             usd: parse_usd_price("0.5")?,
             decimals: 6,
         };
+        // ... and the note carries FEE_NOTE_HEADROOM_BPS on top: 2700.
         assert_eq!(
             paymaster("675000", "1000000000", 0).required_fee_in_token(&native, &cheap)?,
-            1350
+            2700
         );
         // Rounded up: one unit short would be refused by the gate.
         let odd = TokenValuation {
             usd: parse_usd_price("0.3")?,
             decimals: 6,
         };
-        assert_eq!(paymaster("1", "1", 0).required_fee_in_token(&native, &odd)?, 1);
-        // Staging's Gnosis numbers: the wxHOPR note is about 84x the native gas cost.
+        assert_eq!(paymaster("1", "1", 0).required_fee_in_token(&native, &odd)?, 2);
+        // Staging's Gnosis numbers: the wxHOPR note is about 84x the native gas cost, doubled.
         let network = serde_json::from_str::<NetworksEnvelope>(STAGING_NETWORKS)?.into_network(100)?;
         let (native, wxhopr) = fee_note_valuations(&network, 2)?;
         assert_eq!(
             paymaster("675000", "1000000000", 0).required_fee_in_token(&native, &wxhopr)?,
-            56637019634166807
+            2 * 56637019634166807
         );
         Ok(())
     }
