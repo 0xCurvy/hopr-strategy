@@ -1082,6 +1082,10 @@ fn tree_lag_is_recognised_and_polled_at_a_tenth_of_the_budget() {
         "Curvy SDK operation failed: submission rejected: curvyVaultFees failed: RPC_ERROR RPC error \
          during query Curvy Vault fees: Max retries exceeded HTTP error 429 with body: 429 Too Many Requests"
     ));
+    assert!(super::is_retryable_lag(
+        "Curvy SDK operation failed: transport: reading the Curvy indexer's response to /sync/notes?chainId=100: \
+         error decoding response body for url (https://api.curvy.dev/sync/notes?chainId=100)"
+    ));
     assert!(!super::is_retryable_lag("no committed note large enough"));
     assert!(!super::is_retryable_lag(
         "aggregation carries a non-zero protocol fee but no fee-collector identity"
