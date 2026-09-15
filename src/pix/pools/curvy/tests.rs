@@ -699,7 +699,9 @@ impl CurvySdkAdapter for RecordingAdapter {
 
 const SAFE: [u8; 20] = [0x5a; 20];
 
-type ChainNodeOf = ChainNode<Arc<crate::testing::TestChainConnector<crate::testing::FullStateEmulator>>>;
+type ChainNodeOf = ChainNode<
+    Arc<crate::testing::TestChainConnector<crate::testing::BlokliTestClient<crate::testing::FullStateEmulator>>>,
+>;
 
 /// A node over a real chain connector, so that the `HasChainApi` bound is met by the same kind
 /// of type production uses. The chain itself is never touched by these tests.
