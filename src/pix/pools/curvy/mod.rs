@@ -1411,11 +1411,41 @@ where
             tracing::debug!(allocation = ?id, "no committed Curvy notes to sweep yet");
             return Err(StrategyError::CriteriaNotSatisfied);
         }
-        let outcome = self
-            .adapter
-            .withdraw(&secret, notes, dst, amount)
-            .await
-            .map_err(|error| CurvyDepositPoolError::Adapter(error.into()))?;
+        // The SDK proves a sweep against the tree it syncs from the note source, and when the
+        // notes come from Curvy's indexer that tree is a *finalized* checkpoint: while a batch is
+        // still settling the chain's own note index runs ahead of it and the SDK refuses to
+        // reconcile the two ("index did not reconcile"). That is the lag an allocation already
+        // waits out, so a sweep waits for it too, within the same budget, rather than fail a
+        // withdrawal that would succeed once the checkpoint catches up.
+        let deadline = tokio::time::Instant::now() + self.cfg.max_deposit_tracking_time;
+        let poll = tree_lag_poll_interval(self.cfg.max_deposit_tracking_time);
+        let mut waited = 0u32;
+        let outcome = loop {
+            match self.adapter.withdraw(&secret, notes.clone(), dst, amount).await {
+                Ok(outcome) => {
+                    if waited > 0 {
+                        tracing::info!(
+                            allocation = ?id,
+                            attempts = waited + 1,
+                            "swept once the committed tree caught up with the chain"
+                        );
+                    }
+                    break outcome;
+                }
+                Err(error) if is_retryable_lag(&error.to_string()) && tokio::time::Instant::now() + poll < deadline => {
+                    waited += 1;
+                    tracing::info!(
+                        allocation = ?id,
+                        %error,
+                        attempt = waited,
+                        retry_in = ?poll,
+                        "the committed tree or the chain read behind it is not ready for the sweep yet; waiting"
+                    );
+                    tokio::time::sleep(poll).await;
+                }
+                Err(error) => return Err(CurvyDepositPoolError::Adapter(error.into()).into()),
+            }
+        };
         self.remove_spent_notes_retry(id, &outcome.spent_note_ids)?;
         // Best effort: the secret is useless once the allocation is swept, but a leftover one
         // costs nothing but bytes.

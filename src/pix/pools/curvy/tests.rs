@@ -600,6 +600,10 @@ struct RecordingAdapter {
     allocate_attempts: parking_lot::Mutex<usize>,
     allocations: parking_lot::Mutex<Vec<(PixAddressId, BjjPublicKey, CurvyScanPublicKey, HoprBalance)>>,
     withdrawals: parking_lot::Mutex<Vec<(Address, usize)>>,
+    /// How many upcoming `withdraw` calls answer "the index did not reconcile with the chain".
+    sweep_lag_failures: parking_lot::Mutex<usize>,
+    /// Every `withdraw` call, successful or not.
+    withdraw_attempts: parking_lot::Mutex<usize>,
     consistent: parking_lot::Mutex<bool>,
     resets: parking_lot::Mutex<usize>,
 }
@@ -620,6 +624,10 @@ struct ScriptedFailure(String);
 /// What the SDK reports while the funding note is committed on chain but not yet in the tree the
 /// SDK rebuilds from its (finalized) snapshot.
 const TREE_LAG: &str = "Curvy SDK operation failed: PIX aggregation input not found in committed tree";
+/// What the SDK says when the note source's finalized checkpoint trails the chain's note index
+/// while a batch settles — the sweep-side face of the same lag.
+const INDEX_LAG: &str = "Curvy SDK operation failed: sync: index did not reconcile after retries: 70 indexed leaves \
+                         build root 1; checkpoint root 1; chain noteIndex 75 has root 2";
 
 #[async_trait]
 impl CurvySdkAdapter for RecordingAdapter {
@@ -653,6 +661,14 @@ impl CurvySdkAdapter for RecordingAdapter {
         dst: Address,
         _amount: Option<HoprBalance>,
     ) -> Result<CurvyWithdrawalOutcome, Self::Error> {
+        *self.withdraw_attempts.lock() += 1;
+        {
+            let mut lagging = self.sweep_lag_failures.lock();
+            if *lagging > 0 {
+                *lagging -= 1;
+                return Err(ScriptedFailure(INDEX_LAG.to_owned()));
+            }
+        }
         self.withdrawals.lock().push((dst, notes.len()));
         let withdrawn = notes
             .iter()
@@ -1039,6 +1055,47 @@ async fn a_deposit_waits_for_the_committed_tree_instead_of_failing() -> anyhow::
         started.elapsed() >= Duration::from_millis(300),
         "it waited between attempts"
     );
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn a_sweep_waits_for_the_index_to_catch_up_instead_of_failing() -> anyhow::Result<()> {
+    // The allocation is committed and the key recovered, but the SDK's tree — a finalized
+    // checkpoint when the notes come from Curvy's indexer — still trails the chain's note index
+    // while the next batch settles: two attempts refuse to reconcile, then it is there. This is
+    // what stranded a live sweep on Gnosis; a sweep is owed the same patience as a deposit.
+    let adapter = RecordingAdapter::consistent();
+    *adapter.sweep_lag_failures.lock() = 2;
+    let harness = harness(adapter, Duration::from_secs(2)).await?;
+    let pool = &harness.pool;
+    let id = pix_id(1);
+    let owner = BjjKeypair::random();
+    let address = *owner.public();
+    let data = pool.generate_deposit_data(&id).await?;
+    pool.deposit_funds_to(&id, &address, ten(), data.clone()).await?;
+    let (pending, note_id) = pending_note_for(data.scan_key(), &address, 10, 4, "11", 5)?;
+    harness.index.pending.lock().push(pending);
+    let notification = pool.notify_deposit(id, address, ten())?;
+    harness.index.committed.lock().push(completion(&note_id, 6));
+    *harness.index.head.lock() = (8, 1);
+    notification.await?;
+
+    let started = std::time::Instant::now();
+    pool.withdraw_deposit(&id, &owner, Address::from(SAFE), None).await?;
+    assert_eq!(
+        *harness.adapter.withdraw_attempts.lock(),
+        3,
+        "two waits, then the sweep"
+    );
+    assert_eq!(
+        harness.adapter.withdrawals.lock().as_slice(),
+        &[(Address::from(SAFE), 1)]
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "it waited between attempts"
+    );
+    assert!(pool.state().committed_notes(&id)?.is_empty());
     Ok(())
 }
 
