@@ -12,8 +12,9 @@
 //! One builder per bundled pool, each taking that pool's own config: `build_non_anonymous` for
 //! `plain::NonAnonymousDepositPool` and `build_curvy` for `curvy::CurvyDepositPool`. Each
 //! exists whenever its own `strategy-pix-*` feature does, and both may exist at once, so the pool
-//! is named at the call site rather than inferred from the feature graph. For a custom pool,
-//! construct it first and pass it to [`PixStrategy::build_with_pool`].
+//! is named at the call site rather than inferred from the feature graph. A Curvy pool built
+//! elsewhere goes through `build_curvy_with_pool`; any other custom pool is constructed first and
+//! passed to [`PixStrategy::build_with_pool`].
 // The two builders above are code spans, not intra-doc links: each exists only when its own
 // `strategy-pix-*` feature is on, so linking them warns on every single-pool build.
 
@@ -528,6 +529,28 @@ impl PixStrategy {
             node_key,
             pool_cfg,
         )?);
+        let safe_address = node.identity().safe_address;
+
+        self.build_with_pool::<_, _, crate::pix::pools::curvy::PoolKeypair>(pool, node, safe_address)
+    }
+
+    /// Build with a Curvy pool the consumer constructed itself, settling to Baby JubJub
+    /// (`BjjPublicKey`) deposit addresses.
+    ///
+    /// The bundled [`CurvyDepositPool`](crate::pix::pools::curvy::CurvyDepositPool) goes through
+    /// `build_curvy`, which also constructs it. This is the entry point for a pool supplied from
+    /// outside the crate — upstream `hopr-strategy` has its Curvy pool provided by the chain
+    /// connector, and `hoprd` reaches it by this name — so the address-scheme check in `A` is the
+    /// same one `build_curvy` applies, just without the construction. It is
+    /// [`build_with_pool`](Self::build_with_pool) with the keypair fixed.
+    #[cfg(feature = "strategy-pix-curvy")]
+    pub fn build_curvy_with_pool<D, N, A>(self, pool: D, node: Arc<N>) -> Result<Box<dyn StrategyTrait + Send>>
+    where
+        D: DepositPool<crate::pix::pools::curvy::PoolKeypair> + Clone + Send + Sync + 'static,
+        D::Error: Into<StrategyError>,
+        N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
+        A: crate::pix::DepositAddressOf<crate::pix::pools::curvy::PoolKeypair>,
+    {
         let safe_address = node.identity().safe_address;
 
         self.build_with_pool::<_, _, crate::pix::pools::curvy::PoolKeypair>(pool, node, safe_address)
