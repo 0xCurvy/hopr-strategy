@@ -71,6 +71,8 @@ use super::{
 
 const SDK_STATE_TABLE: TableDefinition<u8, Vec<u8>> = TableDefinition::new("curvy_pix_sdk_state");
 const SDK_STATE_KEY: u8 = 0;
+const SDK_ALLOCATIONS_TABLE: TableDefinition<[u8; PixAddressId::SIZE], Vec<u8>> =
+    TableDefinition::new("curvy_pix_sdk_allocations");
 /// Verifier profile `(2, 9)`: nine regular outputs, one reserved for change.
 const MAX_ALLOCATIONS_PER_PROOF: usize = 7;
 /// The pending-commitment profile takes at most five note ids.
@@ -437,8 +439,9 @@ struct SdkState {
     /// received, where a `requestId` we never saw would tell us nothing.
     #[serde(default)]
     relay_intents: Vec<StoredRelayIntent>,
-    #[serde(default)]
-    allocations: Vec<StoredAllocation>,
+    /// Read only for atomic migration of databases written before the keyed table.
+    #[serde(default, rename = "allocations", skip_serializing)]
+    legacy_allocations: Vec<StoredAllocation>,
     #[serde(default)]
     ambiguous_allocation_ids: Vec<[u8; PixAddressId::SIZE]>,
 }
@@ -452,28 +455,93 @@ impl RedbCurvySdkStore {
         let db = state.shared_database();
         let write = db.begin_write().map_err(db_error)?;
         write.open_table(SDK_STATE_TABLE).map_err(db_error)?;
+        write.open_table(SDK_ALLOCATIONS_TABLE).map_err(db_error)?;
         write.commit().map_err(db_error)?;
         Ok(Self { db })
     }
 
     fn load(&self) -> Result<SdkState, RsSdkCurvyAdapterError> {
+        let mut state: SdkState = {
+            let read = self.db.begin_read().map_err(db_error)?;
+            let table = read.open_table(SDK_STATE_TABLE).map_err(db_error)?;
+            table
+                .get(SDK_STATE_KEY)
+                .map_err(db_error)?
+                .map(|value| serde_json::from_slice(&value.value()).map_err(anyhow::Error::new))
+                .transpose()?
+                .unwrap_or_default()
+        };
+        let legacy = std::mem::take(&mut state.legacy_allocations);
+        if !legacy.is_empty() {
+            // The records and removal of the old JSON history become durable together.
+            self.save_update(&state, &legacy, &[])?;
+        }
+        Ok(state)
+    }
+
+    fn allocation(&self, id: &[u8; PixAddressId::SIZE]) -> Result<Option<StoredAllocation>, RsSdkCurvyAdapterError> {
         let read = self.db.begin_read().map_err(db_error)?;
-        let table = read.open_table(SDK_STATE_TABLE).map_err(db_error)?;
-        table
-            .get(SDK_STATE_KEY)
+        let table = read.open_table(SDK_ALLOCATIONS_TABLE).map_err(db_error)?;
+        Ok(table
+            .get(*id)
             .map_err(db_error)?
             .map(|value| serde_json::from_slice(&value.value()).map_err(anyhow::Error::new))
-            .transpose()?
-            .map_or_else(|| Ok(SdkState::default()), Ok)
+            .transpose()?)
+    }
+
+    fn completed_allocations(
+        &self,
+        ids: &[[u8; PixAddressId::SIZE]],
+    ) -> Result<Vec<StoredAllocation>, RsSdkCurvyAdapterError> {
+        ids.iter()
+            .map(|id| {
+                let mut allocation = self.allocation(id)?.ok_or_else(|| {
+                    RsSdkCurvyAdapterError::InvalidValue("missing prepared allocation record".to_owned())
+                })?;
+                allocation.stage = StoredAllocationStage::Completed;
+                Ok(allocation)
+            })
+            .collect()
     }
 
     fn save(&self, state: &SdkState) -> Result<(), RsSdkCurvyAdapterError> {
+        self.save_update(state, &[], &[])
+    }
+
+    fn save_update(
+        &self,
+        state: &SdkState,
+        allocations: &[StoredAllocation],
+        remove: &[[u8; PixAddressId::SIZE]],
+    ) -> Result<(), RsSdkCurvyAdapterError> {
         let encoded = serde_json::to_vec(state).map_err(anyhow::Error::new)?;
         let write = self.db.begin_write().map_err(db_error)?;
         {
             let mut table = write.open_table(SDK_STATE_TABLE).map_err(db_error)?;
             table.insert(SDK_STATE_KEY, encoded).map_err(db_error)?;
+            let mut records = write.open_table(SDK_ALLOCATIONS_TABLE).map_err(db_error)?;
+            for allocation in allocations {
+                let encoded = serde_json::to_vec(allocation).map_err(anyhow::Error::new)?;
+                records.insert(allocation.id, encoded).map_err(db_error)?;
+            }
+            for id in remove {
+                records.remove(*id).map_err(db_error)?;
+            }
         }
+        write.commit().map_err(db_error)?;
+        Ok(())
+    }
+
+    fn reset(&self, state: &SdkState) -> Result<(), RsSdkCurvyAdapterError> {
+        let encoded = serde_json::to_vec(state).map_err(anyhow::Error::new)?;
+        let write = self.db.begin_write().map_err(db_error)?;
+        write.delete_table(SDK_ALLOCATIONS_TABLE).map_err(db_error)?;
+        write.open_table(SDK_ALLOCATIONS_TABLE).map_err(db_error)?;
+        write
+            .open_table(SDK_STATE_TABLE)
+            .map_err(db_error)?
+            .insert(SDK_STATE_KEY, encoded)
+            .map_err(db_error)?;
         write.commit().map_err(db_error)?;
         Ok(())
     }
@@ -968,13 +1036,9 @@ where
             state.ambiguous_inputs.clear();
             state.ambiguous_change = None;
             state.ambiguous_emitted.clear();
-            for allocation in &mut state.allocations {
-                if allocation_ids.contains(&allocation.id) {
-                    allocation.stage = StoredAllocationStage::Completed;
-                }
-            }
+            let completed = self.store.completed_allocations(&allocation_ids)?;
             state.ambiguous_allocation_ids.clear();
-            self.store.save(&state)?;
+            self.store.save_update(&state, &completed, &[])?;
         }
         self.recover_pending().await?;
         Ok(true)
@@ -1188,14 +1252,9 @@ where
             return Err(RsSdkCurvyAdapterError::AmbiguousAllocation);
         }
         let deposits = {
-            let state = self.state.lock();
             let mut pending = Vec::new();
             for (id, address, scan_key, amount) in deposits {
-                if let Some(existing) = state
-                    .allocations
-                    .iter()
-                    .find(|allocation| allocation.id == id_bytes(id))
-                {
+                if let Some(existing) = self.store.allocation(&id_bytes(id))? {
                     if !existing.matches(address, *scan_key, *amount) {
                         return Err(RsSdkCurvyAdapterError::ConflictingAllocation);
                     }
@@ -1275,9 +1334,8 @@ where
                 .map(|(id, address, scan_key, amount)| StoredAllocation::new(*id, address, *scan_key, *amount))
                 .collect::<Result<Vec<_>, _>>()?;
             {
-                let mut state = self.state.lock();
-                state.allocations.extend(allocation_records.clone());
-                self.store.save(&state)?;
+                let state = self.state.lock();
+                self.store.save_update(&state, &allocation_records, &[])?;
             }
             let funding_notes = funding.iter().map(|(_, note, _)| note.clone()).collect::<Vec<_>>();
             let aggregated = client
@@ -1340,11 +1398,9 @@ where
                         state.ambiguous_allocation_ids = allocation_records.iter().map(|record| record.id).collect();
                         self.store.save(&state)?;
                     } else {
-                        let mut state = self.state.lock();
-                        state
-                            .allocations
-                            .retain(|allocation| !allocation_records.iter().any(|record| record.id == allocation.id));
-                        self.store.save(&state)?;
+                        let state = self.state.lock();
+                        let ids = allocation_records.iter().map(|record| record.id).collect::<Vec<_>>();
+                        self.store.save_update(&state, &[], &ids)?;
                     }
                     return Err(error.into());
                 }
@@ -1362,12 +1418,9 @@ where
                         .filter(|note| note.amount != Fr::from(0_u8))
                         .map(StoredNote::from),
                 );
-                for allocation in &mut state.allocations {
-                    if allocation_records.iter().any(|record| record.id == allocation.id) {
-                        allocation.stage = StoredAllocationStage::Completed;
-                    }
-                }
-                self.store.save(&state)?;
+                let ids = allocation_records.iter().map(|record| record.id).collect::<Vec<_>>();
+                let completed = self.store.completed_allocations(&ids)?;
+                self.store.save_update(&state, &completed, &[])?;
             }
             for entry in &result.ledger {
                 tracing::info!(
@@ -1553,7 +1606,7 @@ where
             spender: state.spender.clone(),
             ..Default::default()
         };
-        self.store.save(&state)
+        self.store.reset(&state)
     }
 }
 
@@ -1658,7 +1711,7 @@ mod tests {
                 note.deposit.amount,
             )];
             assert!(adapter.allocate_all(&deposits).await.is_err());
-            assert!(adapter.state.lock().allocations.is_empty());
+            assert!(adapter.store.allocation(&id_bytes(&note.deposit.id))?.is_none());
             assert!(!queried_chain.load(Ordering::SeqCst));
             fail.store(false, Ordering::SeqCst);
             let result = adapter.allocate_all(&deposits).await;
@@ -1667,8 +1720,105 @@ mod tests {
                 queried_chain.load(Ordering::SeqCst),
                 "retry reached preparation with the same allocation ID"
             );
-            assert!(adapter.state.lock().allocations.is_empty());
+            assert!(adapter.store.allocation(&id_bytes(&note.deposit.id))?.is_none());
         }
+        Ok(())
+    }
+
+    fn stored_fixture(amount: u64) -> anyhow::Result<StoredAllocation> {
+        let note = fixture(amount);
+        Ok(StoredAllocation::new(
+            note.deposit.id,
+            &note.deposit.address,
+            scan_key("07", "0b")?,
+            note.deposit.amount,
+        )?)
+    }
+
+    #[test]
+    fn allocation_history_migrates_atomically_and_survives_reopening() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state.redb");
+        let mut completed = stored_fixture(7)?;
+        completed.stage = StoredAllocationStage::Completed;
+        let prepared = stored_fixture(8)?;
+        {
+            let db = RedbCurvyDepositState::open(&path)?;
+            let store = RedbCurvySdkStore::new(&db)?;
+            let mut legacy = serde_json::to_value(SdkState::default())?;
+            legacy["allocations"] = serde_json::json!([completed, prepared]);
+            let write = store.db.begin_write()?;
+            write
+                .open_table(SDK_STATE_TABLE)?
+                .insert(SDK_STATE_KEY, serde_json::to_vec(&legacy)?)?;
+            write.commit()?;
+            let loaded = store.load()?;
+            assert!(loaded.legacy_allocations.is_empty());
+            assert_eq!(store.allocation(&completed.id)?, Some(completed.clone()));
+            assert_eq!(store.allocation(&prepared.id)?, Some(prepared.clone()));
+            let read = store.db.begin_read()?;
+            let bytes = read.open_table(SDK_STATE_TABLE)?.get(SDK_STATE_KEY)?.unwrap().value();
+            assert!(
+                serde_json::from_slice::<serde_json::Value>(&bytes)?
+                    .get("allocations")
+                    .is_none()
+            );
+        }
+        let db = RedbCurvyDepositState::open(&path)?;
+        let store = RedbCurvySdkStore::new(&db)?;
+        store.load()?;
+        assert_eq!(store.allocation(&completed.id)?, Some(completed));
+        assert_eq!(store.allocation(&prepared.id)?, Some(prepared));
+        Ok(())
+    }
+
+    #[test]
+    fn saving_active_state_does_not_rewrite_allocation_history() -> anyhow::Result<()> {
+        let db = RedbCurvyDepositState::in_memory()?;
+        let store = RedbCurvySdkStore::new(&db)?;
+        let state = SdkState::default();
+        let record = stored_fixture(7)?;
+        let records = (0u64..10_000)
+            .map(|n| {
+                let mut row = record.clone();
+                row.id[..8].copy_from_slice(&n.to_be_bytes());
+                row.stage = StoredAllocationStage::Completed;
+                row
+            })
+            .collect::<Vec<_>>();
+        store.save_update(&state, &records, &[])?;
+        store.save(&state)?;
+        assert_eq!(store.allocation(&records[0].id)?, Some(records[0].clone()));
+        assert_eq!(store.allocation(&records[9999].id)?, Some(records[9999].clone()));
+        let read = store.db.begin_read()?;
+        let encoded = read.open_table(SDK_STATE_TABLE)?.get(SDK_STATE_KEY)?.unwrap().value();
+        assert_eq!(encoded, serde_json::to_vec(&state)?);
+        assert!(encoded.len() < 1000);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completed_allocations_still_prevent_duplicate_funding() -> anyhow::Result<()> {
+        let server = relayer::http_tests::Server::new(|_, _| panic!("a duplicate must make no HTTP requests")).await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = test_adapter(&state, server.url.clone())?;
+        let note = fixture(7);
+        let key = scan_key("07", "0b")?;
+        let mut record = StoredAllocation::new(note.deposit.id, &note.deposit.address, key, note.deposit.amount)?;
+        record.stage = StoredAllocationStage::Completed;
+        adapter.store.save_update(&adapter.state.lock(), &[record], &[])?;
+        let deposits = [(note.deposit.id, note.deposit.address, key, note.deposit.amount)];
+        assert!(adapter.allocate_all(&deposits).await?.is_empty());
+        let changed = [(
+            note.deposit.id,
+            note.deposit.address,
+            key,
+            HoprBalance::from(U256::from(9)),
+        )];
+        assert!(matches!(
+            adapter.allocate_all(&changed).await,
+            Err(RsSdkCurvyAdapterError::ConflictingAllocation)
+        ));
         Ok(())
     }
 
