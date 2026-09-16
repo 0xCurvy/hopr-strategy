@@ -573,6 +573,7 @@ impl CurvyIndexSource for ScriptedIndex {
             .cloned()
             .collect())
     }
+
     async fn indexed_head(&self) -> Result<(u64, u64), String> {
         Ok(*self.head.lock())
     }
@@ -956,7 +957,7 @@ async fn a_batch_is_one_allocation_call() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn state_from_another_chain_is_discarded_on_first_use() -> anyhow::Result<()> {
+async fn missing_notes_preserve_state_and_reconciliation_can_retry() -> anyhow::Result<()> {
     let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
     let pool = &harness.pool;
     let fixture = owned_candidate(1)?;
@@ -970,20 +971,21 @@ async fn state_from_another_chain_is_discarded_on_first_use() -> anyhow::Result<
     pool.state()
         .record_owned_candidate(&fixture.note_id, detected, &CurvyEventCursor::from(&position(1)))?;
     pool.state().store_scan_secret(&fixture.id, &fixture.scan_secret)?;
-    // The endpoint has never heard of that note.
+    // An incomplete/rebuilt index is not evidence of another chain.
     *harness.index.known_notes.lock() = Some(HashSet::new());
     *harness.index.head.lock() = (10, 1);
-
     let first_id = pix_id(9);
-    pool.generate_deposit_data(&first_id).await?;
+    assert!(pool.generate_deposit_data(&first_id).await.is_err());
+    assert_eq!(pool.state().owned_note_ids()?, vec![fixture.note_id.clone()]);
+    assert!(pool.state().scan_secret(&fixture.id)?.is_some());
+    assert_eq!(*harness.adapter.resets.lock(), 0);
 
-    assert!(pool.state().owned_note_ids()?.is_empty());
-    assert!(pool.state().scan_secret(&fixture.id)?.is_none());
-    assert_eq!(*harness.adapter.resets.lock(), 1);
-    // Once per process: the fresh data written above survives the next call.
+    *harness.index.known_notes.lock() = Some(HashSet::from([fixture.note_id]));
+    pool.generate_deposit_data(&first_id).await?;
     pool.generate_deposit_data(&pix_id(10)).await?;
     assert!(pool.state().scan_secret(&first_id)?.is_some());
-    assert_eq!(*harness.adapter.resets.lock(), 1);
+    assert!(pool.state().scan_secret(&fixture.id)?.is_some());
+    assert_eq!(*harness.adapter.resets.lock(), 0);
     Ok(())
 }
 
@@ -1140,8 +1142,8 @@ fn tree_lag_is_recognised_and_polled_at_a_tenth_of_the_budget() {
     assert!(!super::is_tree_lag("no committed note large enough"));
     // A rate-limited or failed RPC read behind Blokli is waited out the same way.
     assert!(super::is_retryable_lag(
-        "Curvy SDK operation failed: submission rejected: curvyVaultFees failed: RPC_ERROR RPC error \
-         during query Curvy Vault fees: Max retries exceeded HTTP error 429 with body: 429 Too Many Requests"
+        "Curvy SDK operation failed: submission rejected: curvyVaultFees failed: RPC_ERROR RPC error during query \
+         Curvy Vault fees: Max retries exceeded HTTP error 429 with body: 429 Too Many Requests"
     ));
     assert!(super::is_retryable_lag(
         "Curvy SDK operation failed: transport: reading the Curvy indexer's response to /sync/notes?chainId=100: \
@@ -1511,5 +1513,40 @@ fn modes_round_trip_as_lowercase() -> anyhow::Result<()> {
     assert!(encoded.contains(r#""shielding":"portal""#), "{encoded}");
     assert!(encoded.contains(r#""submission":"operator""#), "{encoded}");
     assert_eq!(serde_json::from_str::<CurvyDepositPoolConfig>(&encoded)?, cfg);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_index_behind_the_saved_cursor_preserves_recovery_state() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    let pool = &harness.pool;
+    let id = pix_id(1);
+    let secret = scan_secret("03", "04")?;
+    pool.state().store_scan_secret(&id, &secret)?;
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        pool.state()
+            .advance_cursor(kind, &CurvyEventCursor::from(&position(100)))?;
+    }
+    *harness.index.head.lock() = (99, 1);
+    assert!(pool.generate_deposit_data(&id).await.is_err());
+    assert_eq!(pool.state().scan_secret(&id)?.unwrap().public(), secret.public());
+    assert_eq!(*harness.adapter.resets.lock(), 0);
+    *harness.index.head.lock() = (100, 1);
+    assert_eq!(*pool.generate_deposit_data(&id).await?.scan_key(), secret.public());
+    Ok(())
+}
+
+#[tokio::test]
+async fn unconfirmed_sdk_funding_never_resets_the_pool() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    let id = pix_id(1);
+    let secret = scan_secret("03", "04")?;
+    harness.pool.state().store_scan_secret(&id, &secret)?;
+    *harness.adapter.consistent.lock() = false;
+    assert!(harness.pool.generate_deposit_data(&id).await.is_err());
+    assert!(harness.pool.state().scan_secret(&id)?.is_some());
+    assert_eq!(*harness.adapter.resets.lock(), 0);
+    *harness.adapter.consistent.lock() = true;
+    harness.pool.generate_deposit_data(&id).await?;
     Ok(())
 }

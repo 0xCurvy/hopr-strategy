@@ -78,8 +78,7 @@ pub trait CurvyIndexSource: Send + Sync + 'static {
     async fn nullifier_spent(&self, nullifier: String) -> Result<bool, String>;
 
     /// Whether the aggregator knows `note_id` (a `0x`-prefixed 32-byte hex string) at all —
-    /// pending or committed. A chain that has never seen a note this node recorded is not the
-    /// chain the record came from.
+    /// pending or committed. An unknown note can also mean the index is still catching up.
     async fn note_known(&self, note_id: String) -> Result<bool, String>;
 
     /// Committed notes strictly after `after`, carrying what the detector scans, for sources

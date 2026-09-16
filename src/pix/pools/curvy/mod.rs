@@ -88,14 +88,13 @@
 //!   identity, the funding notes, every discovered note and the scan secrets. Losing it loses the ability to sweep what
 //!   has not been swept yet.
 //!
-//! ### Restarts and stale state
+//! ### Restarts and synchronization
 //!
-//! The state file describes one particular chain. Against a re-created development chain — the
-//! localcluster does exactly that on every run — the same file would make the Entry believe it is
-//! funded and the Exit skip events it has not seen. So the first operation after a start checks
-//! the state against the endpoint: a cursor past the indexer's head, or a note the aggregator has
-//! never heard of, means a different chain, and everything chain-specific is discarded (the
-//! node's Curvy identity is kept).
+//! A saved cursor ahead of the index or a temporarily unknown note can mean the endpoint is
+//! rebuilding its index. Reconciliation then fails without deleting any recovery state and is
+//! retried on the next operation. Missing notes are never proof of a different deployment.
+//! For a deliberately re-created development chain, select a fresh `state_path`; keep the old
+//! database available for recovering funds on its original deployment.
 //!
 //! Enabled by `strategy-pix-curvy`, to be paired with `hopr-lib/pix-bjj` (the default) so that
 //! `HoprPixSpec` produces the `BjjPublicKey` deposit addresses this pool settles to. Built through
@@ -632,6 +631,11 @@ pub enum CurvyDepositPoolError {
     },
     #[error("Curvy deposit watcher stopped before the deposit was committed")]
     WatcherStopped,
+    #[error(
+        "Curvy recovery state is not yet confirmed by the endpoint; retry after synchronization, or use a fresh \
+         state_path for a new deployment"
+    )]
+    ReconciliationPending,
     #[error("Curvy indexer query failed: {0}")]
     Indexer(String),
     #[error("timed out waiting for a Curvy deposit to be committed")]
@@ -983,19 +987,13 @@ where
         &self.tracker.state
     }
 
-    /// Runs the stale-state check once per process. See the module docs.
+    /// Complete reconciliation once the endpoint can account for our durable state.
+    /// A failed check leaves the cell uninitialized, so the next operation retries it.
     async fn ensure_reconciled(&self) -> Result<(), CurvyDepositPoolError> {
         self.reconciled
             .get_or_try_init(|| async {
-                if self.state_is_stale().await? {
-                    tracing::warn!(
-                        "the Curvy PIX state describes a chain other than the one behind the endpoint; discarding it \
-                         and starting over"
-                    );
-                    self.tracker.state.wipe_chain_state()?;
-                    self.adapter
-                        .reset_chain_state()
-                        .map_err(|error| CurvyDepositPoolError::Adapter(error.into()))?;
+                if self.state_needs_sync().await? {
+                    return Err(CurvyDepositPoolError::ReconciliationPending);
                 }
                 Ok(())
             })
@@ -1003,7 +1001,7 @@ where
             .map(|_| ())
     }
 
-    async fn state_is_stale(&self) -> Result<bool, CurvyDepositPoolError> {
+    async fn state_needs_sync(&self) -> Result<bool, CurvyDepositPoolError> {
         let (head, _) = self
             .index
             .indexed_head()
