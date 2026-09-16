@@ -9,11 +9,14 @@
 //!
 //! The PIX deposit address stays what the SSA protocol makes it: the Baby JubJub public key whose
 //! private key the Exit reconstructs from shares. That key is the note's **owner** and the only
-//! spending authority. What Curvy adds is *discovery*: the Exit cannot scan the whole pool with a
-//! key it does not have yet, so for every SSA it mints a throwaway **scan identity** `(K, V)` — a
-//! stealth meta-key pair whose spend scalar is discarded on the spot. The public half travels to
-//! the Entry as the allocation's deposit data; the view scalar `v` stays at the Exit, persisted
-//! keyed by the allocation, and is what later recognises the note among everyone else's.
+//! spending authority. Curvy adds a separate **scan identity** `(K, V)` for discovering and
+//! decrypting the allocation before the Exit has reconstructed the SSA private key. The Entry
+//! explicitly assigns the note to the SSA owner, independently of these scan keys. Keeping all
+//! the scan key material would still not let the Exit spend the note without the SSA private key.
+//!
+//! The public scan identity travels to the Entry as deposit data. The Exit persists the view
+//! scalar `v` and public `K` for discovery; the unused scalar `k` is discarded as key hygiene,
+//! not as a condition of the protocol's security.
 //!
 //! | event | who | what this pool does |
 //! |---|---|---|
@@ -1036,12 +1039,12 @@ where
             .map_err(|error| CurvyDepositPoolError::Adapter(error.into()))
     }
 
-    /// A fresh scan identity: `(K, V)` from Curvy's stealth key generation, with the spend scalar
-    /// `k` discarded immediately. The Exit keeps `v` and `K`; the Entry gets `K` and `V`.
+    /// A fresh discovery identity. The Exit keeps `v` and `K`; the Entry gets `K` and `V`.
+    /// The unused scalar `k` is unrelated to the SSA private key that authorizes spending.
     fn generate_scan_secret() -> Result<CurvyScanSecret, CurvyDepositPoolError> {
         let (k, v, big_k, big_v) =
             stealth::new_meta().map_err(|error| CurvyDepositPoolError::ScanIdentity(error.to_string()))?;
-        // Never a spending key of anything: dropped as soon as it exists.
+        // PIX does not use this scalar. Retaining it would not authorize spending an SSA-owned note.
         drop(Zeroizing::new(k));
         let v = Zeroizing::new(v);
         let v_bytes = Zeroizing::new(
