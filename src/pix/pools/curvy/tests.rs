@@ -974,14 +974,15 @@ async fn state_from_another_chain_is_discarded_on_first_use() -> anyhow::Result<
     *harness.index.known_notes.lock() = Some(HashSet::new());
     *harness.index.head.lock() = (10, 1);
 
-    pool.generate_deposit_data(&pix_id(9)).await?;
+    let first_id = pix_id(9);
+    pool.generate_deposit_data(&first_id).await?;
 
     assert!(pool.state().owned_note_ids()?.is_empty());
     assert!(pool.state().scan_secret(&fixture.id)?.is_none());
     assert_eq!(*harness.adapter.resets.lock(), 1);
     // Once per process: the fresh data written above survives the next call.
     pool.generate_deposit_data(&pix_id(10)).await?;
-    assert!(pool.state().scan_secret(&pix_id(9)).is_ok());
+    assert!(pool.state().scan_secret(&first_id)?.is_some());
     assert_eq!(*harness.adapter.resets.lock(), 1);
     Ok(())
 }
@@ -1003,7 +1004,8 @@ async fn state_from_the_same_chain_is_kept() -> anyhow::Result<()> {
     *harness.index.known_notes.lock() = Some(HashSet::from([fixture.note_id.clone()]));
     *harness.index.head.lock() = (10, 1);
 
-    pool.generate_deposit_data(&pix_id(9)).await?;
+    let first_id = pix_id(9);
+    pool.generate_deposit_data(&first_id).await?;
 
     assert_eq!(pool.state().owned_note_ids()?, vec![fixture.note_id]);
     assert_eq!(*harness.adapter.resets.lock(), 0);
