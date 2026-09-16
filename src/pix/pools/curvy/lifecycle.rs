@@ -46,7 +46,7 @@ use super::{
 };
 
 const QUERY_PAGE_SIZE: u32 = 1_000;
-/// Pause between two passes over the index, and after a failed one.
+/// Normal polling interval between successful passes over the index.
 ///
 /// Short, because it sits directly on the confirmation latency: a commitment becomes final one
 /// block after it lands, and every pass that starts just before that block wastes a whole
@@ -485,26 +485,36 @@ where
 ///
 /// Runs until aborted. Captures only the client and the tracker — never the pool — so that
 /// dropping the pool is what ends it (see `CurvyDepositPool`'s `Drop`).
-pub(super) async fn run_watcher<I, S>(client: Arc<I>, tracker: Arc<CurvyLifecycleTracker<S>>)
+pub(super) async fn run_watcher<I, S>(client: Arc<I>, tracker: Arc<CurvyLifecycleTracker<S>>, tracking_budget: Duration)
 where
     I: CurvyIndexSource,
     S: CurvyDepositState,
 {
+    // Keep several retry opportunities within even a short deposit tracking budget.
+    let cap = (tracking_budget / 10).clamp(RECONNECT_DELAY, Duration::from_secs(5));
+    let mut retry_delay = RECONNECT_DELAY;
     loop {
         if tracker.watched_allocations().is_empty() {
+            retry_delay = RECONNECT_DELAY;
             tokio::time::sleep(RECONNECT_DELAY).await;
             continue;
         }
 
         let replay_history = tracker.replay_history.swap(false, Ordering::AcqRel);
-        if let Err(error) = catch_up(client.as_ref(), tracker.as_ref(), replay_history).await {
-            tracker.restore_failed_replay(replay_history);
-            tracing::warn!(
-                %error,
-                replay_history,
-                "failed to catch up Curvy PIX notes; retrying without losing historical replay"
-            );
-        }
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        let delay = match catch_up(client.as_ref(), tracker.as_ref(), replay_history).await {
+            Ok(()) => {
+                retry_delay = RECONNECT_DELAY;
+                RECONNECT_DELAY
+            }
+            Err(error) => {
+                tracker.restore_failed_replay(replay_history);
+                let delay = retry_delay;
+                retry_delay = retry_delay.saturating_mul(2).min(cap);
+                tracing::warn!(%error, replay_history, retry_in = ?delay,
+                    "failed to catch up Curvy PIX notes; retrying without losing historical replay");
+                delay
+            }
+        };
+        tokio::time::sleep(delay).await;
     }
 }

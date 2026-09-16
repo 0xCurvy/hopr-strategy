@@ -495,6 +495,8 @@ fn deposit_data_round_trips_through_the_wire_form() -> anyhow::Result<()> {
 /// A note index the test writes to directly, standing in for Blokli.
 #[derive(Default)]
 struct ScriptedIndex {
+    fail_pending: std::sync::atomic::AtomicBool,
+    pending_calls: std::sync::atomic::AtomicUsize,
     snapshot_pending: bool,
     pending: parking_lot::Mutex<Vec<CurvyPendingNote>>,
     /// Committed notes served as candidates, for a source whose pending view missed them.
@@ -532,6 +534,10 @@ impl CurvyIndexSource for ScriptedIndex {
         after: Option<CurvyEventCursor>,
         first: u32,
     ) -> Result<super::PendingNotesPage, String> {
+        self.pending_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_pending.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("endpoint unavailable".to_owned());
+        }
         if self.snapshot_pending {
             return Ok(super::PendingNotesPage {
                 notes: self.pending.lock().clone(),
@@ -1616,5 +1622,42 @@ async fn full_pending_snapshot_reaches_committed_notes() -> anyhow::Result<()> {
         assert_eq!(tokio::time::timeout(Duration::from_secs(1), receiver).await??, ten());
         assert_eq!(state.committed_amount(&fixture.id)?, ten());
     }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn watcher_failures_back_off_and_success_resets_polling() -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(1)?;
+    let tracker = Arc::new(CurvyLifecycleTracker::new(Arc::new(fixture.detector), state));
+    let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret, ten())?;
+    let index = Arc::new(ScriptedIndex::default());
+    index.fail_pending.store(true, Ordering::SeqCst);
+    let worker = tokio::spawn(super::lifecycle::run_watcher(
+        index.clone(),
+        tracker.clone(),
+        Duration::from_secs(10),
+    ));
+    tokio::task::yield_now().await;
+    assert_eq!(index.pending_calls.load(Ordering::SeqCst), 1);
+    for (delay, count) in [(250, 2), (500, 3), (1000, 4), (1000, 5)] {
+        tokio::time::advance(Duration::from_millis(delay - 1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(index.pending_calls.load(Ordering::SeqCst), count - 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(index.pending_calls.load(Ordering::SeqCst), count);
+        assert!(tracker.replay_history.load(Ordering::SeqCst));
+    }
+    index.fail_pending.store(false, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(index.pending_calls.load(Ordering::SeqCst), 6);
+    assert!(!tracker.replay_history.load(Ordering::SeqCst));
+    tokio::time::advance(Duration::from_millis(250)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(index.pending_calls.load(Ordering::SeqCst), 7);
+    worker.abort();
     Ok(())
 }

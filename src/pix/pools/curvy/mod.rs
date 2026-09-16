@@ -1147,7 +1147,11 @@ where
         // is what ends the task (see `Drop`) rather than the task keeping the pool alive.
         let index = Arc::clone(&self.index);
         let tracker = Arc::clone(&self.tracker);
-        *watcher = Some(tokio::spawn(lifecycle::run_watcher(index, tracker)));
+        *watcher = Some(tokio::spawn(lifecycle::run_watcher(
+            index,
+            tracker,
+            self.cfg.max_deposit_tracking_time,
+        )));
     }
 
     async fn allocate(
