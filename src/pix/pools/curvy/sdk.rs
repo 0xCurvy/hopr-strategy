@@ -1213,6 +1213,21 @@ where
         let mut receipts = Vec::new();
         self.recover_pending().await?;
         for chunk in deposits.chunks(MAX_ALLOCATIONS_PER_PROOF) {
+            // A relayed aggregation carries a gas-reimbursement note for the relayer's operator;
+            // a self-submitted one pays its own gas and carries none.
+            let relay_fee = match (self.config.submission, self.relay.as_ref()) {
+                (CurvySubmission::Relayer, Some(relay)) => {
+                    Self::relay_fee_recipient(relay, endpoints.chain_id, self.config.token).await?
+                }
+                (CurvySubmission::Relayer, None) => {
+                    return Err(RsSdkCurvyAdapterError::InvalidValue(
+                        "relayed submission was selected but the pool was built without a relayer".to_owned(),
+                    ));
+                }
+                (CurvySubmission::Operator, _) => None,
+            };
+            let fee_recipient = self.fee_recipient().await?;
+
             let allocations = chunk
                 .iter()
                 .map(|(_id, address, scan_key, amount)| {
@@ -1265,20 +1280,6 @@ where
                 self.store.save(&state)?;
             }
             let funding_notes = funding.iter().map(|(_, note, _)| note.clone()).collect::<Vec<_>>();
-            // A relayed aggregation carries a gas-reimbursement note for the relayer's operator;
-            // a self-submitted one pays its own gas and carries none.
-            let relay_fee = match (self.config.submission, self.relay.as_ref()) {
-                (CurvySubmission::Relayer, Some(relay)) => {
-                    Self::relay_fee_recipient(relay, endpoints.chain_id, self.config.token).await?
-                }
-                (CurvySubmission::Relayer, None) => {
-                    return Err(RsSdkCurvyAdapterError::InvalidValue(
-                        "relayed submission was selected but the pool was built without a relayer".to_owned(),
-                    ));
-                }
-                (CurvySubmission::Operator, _) => None,
-            };
-            let fee_recipient = self.fee_recipient().await?;
             let aggregated = client
                 .build_pix_aggregation(
                     &self.spender,
@@ -1583,6 +1584,93 @@ mod tests {
     use crate::pix::pools::curvy::{OwnedCurvyDeposit, detect::public_key_from_dec};
 
     type Adapter = RsSdkCurvyAdapter<blokli_client::BlokliClient>;
+
+    fn test_adapter(state: &RedbCurvyDepositState, url: Url) -> anyhow::Result<Adapter> {
+        let blokli = Arc::new(blokli_client::BlokliClient::new(url.clone(), Default::default()));
+        let config = RsSdkCurvyAdapterConfig::new(String::new(), 4).with_modes(
+            CurvyShielding::Direct,
+            CurvySubmission::Relayer,
+            Some(url.clone()),
+        );
+        let adapter = Adapter::new(
+            blokli,
+            url.to_string(),
+            config,
+            Arc::new(|_, _| Box::pin(async { panic!("unexpected funding call") })),
+            None,
+            Some(Arc::new(RelayClient::new(
+                url.clone(),
+                std::time::Duration::from_secs(2),
+            )?)),
+            state,
+        )?;
+        let endpoints = CurvyChainEndpoints {
+            aggregator: format!("0x{}", "01".repeat(20)),
+            portal_factory: None,
+            vault: format!("0x{}", "02".repeat(20)),
+            token_address: format!("0x{}", "03".repeat(20)),
+            chain_id: 100,
+        };
+        assert!(
+            adapter
+                .client
+                .set((
+                    blokli_curvy_client(url.as_str().trim_end_matches('/'), &endpoints, None),
+                    endpoints
+                ))
+                .is_ok()
+        );
+        Ok(adapter)
+    }
+
+    #[tokio::test]
+    async fn fee_discovery_failures_do_not_prepare_allocations() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for failed_path in ["/relay/paymaster", "/protocol"] {
+            let fail = Arc::new(AtomicBool::new(true));
+            let queried_chain = Arc::new(AtomicBool::new(false));
+            let server = relayer::http_tests::Server::new({
+                let fail = fail.clone();
+                let queried_chain = queried_chain.clone();
+                move |path, _| {
+                    if path.starts_with(failed_path) && fail.load(Ordering::SeqCst) {
+                        return Some((500, serde_json::json!({"error":"RPC_ERROR"})));
+                    }
+                    Some(if path.starts_with("/relay/paymaster") {
+                        (404, serde_json::Value::Null)
+                    } else if path == "/protocol" {
+                        (200, serde_json::json!({"data":{"feeCollector":null}}))
+                    } else {
+                        assert_eq!(path, "/graphql");
+                        queried_chain.store(true, Ordering::SeqCst);
+                        (500, serde_json::json!({"error":"stop before proving"}))
+                    })
+                }
+            })
+            .await;
+            let state = RedbCurvyDepositState::in_memory()?;
+            let adapter = test_adapter(&state, server.url.clone())?;
+            let note = fixture(7);
+            let deposits = [(
+                note.deposit.id,
+                note.deposit.address,
+                scan_key("07", "0b")?,
+                note.deposit.amount,
+            )];
+            assert!(adapter.allocate_all(&deposits).await.is_err());
+            assert!(adapter.state.lock().allocations.is_empty());
+            assert!(!queried_chain.load(Ordering::SeqCst));
+            fail.store(false, Ordering::SeqCst);
+            let result = adapter.allocate_all(&deposits).await;
+            assert!(!matches!(result, Err(RsSdkCurvyAdapterError::AmbiguousAllocation)));
+            assert!(
+                queried_chain.load(Ordering::SeqCst),
+                "retry reached preparation with the same allocation ID"
+            );
+            assert!(adapter.state.lock().allocations.is_empty());
+        }
+        Ok(())
+    }
 
     #[test]
     fn portal_signer_is_required_independently_of_submission_mode() {
