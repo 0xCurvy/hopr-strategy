@@ -466,7 +466,10 @@ impl RelayClient {
             .map_err(|error| RelayError::Transport(error.to_string()))?;
         if response.status() == reqwest::StatusCode::CONFLICT {
             // The relayer answers a conflict with the submission already holding the spend.
-            return Self::decode(response).await;
+            return response
+                .json::<RelaySubmission>()
+                .await
+                .map_err(|error| RelayError::Transport(format!("invalid relayer conflict response: {error}")));
         }
         Self::decode(response).await
     }
@@ -811,5 +814,148 @@ mod tests {
         let described = RelayClient::describe(reqwest::StatusCode::BAD_GATEWAY, "<html>gateway</html>");
         assert!(described.contains("502"), "{described}");
         assert!(described.contains("gateway"), "{described}");
+    }
+}
+
+/// Local HTTP fixtures exercise the actual reqwest boundary without external services.
+#[cfg(test)]
+pub(super) mod http_tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    pub struct Server {
+        pub url: Url,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl Server {
+        pub async fn new(
+            handler: impl Fn(&str, serde_json::Value) -> Option<(u16, serde_json::Value)> + Send + 'static,
+        ) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
+            let task = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut input = Vec::new();
+                    let (head_end, length) = loop {
+                        let mut buffer = [0; 4096];
+                        let n = socket.read(&mut buffer).await.unwrap();
+                        if n == 0 {
+                            break (input.len(), 0);
+                        }
+                        input.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = input.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&input[..end]);
+                            let length = head
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap_or(0);
+                            break (end + 4, length);
+                        }
+                    };
+                    while input.len() < head_end + length {
+                        let mut buffer = [0; 4096];
+                        let n = socket.read(&mut buffer).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        input.extend_from_slice(&buffer[..n]);
+                    }
+                    let head = String::from_utf8_lossy(&input[..head_end]);
+                    let path = head.split_whitespace().nth(1).unwrap_or("");
+                    let body = serde_json::from_slice(&input[head_end..]).unwrap_or(serde_json::Value::Null);
+                    if let Some((status, response)) = handler(path, body) {
+                        let body = response.to_string();
+                        let response = format!(
+                            "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: \
+                             {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                    }
+                }
+            });
+            Self { url, task }
+        }
+    }
+
+    pub fn proof() -> curvy_abi::curvy_types::Groth16Proof {
+        serde_json::from_value(serde_json::json!({"a":["1","2"],"b":[["3","4"],["5","6"]],"c":["7","8"]})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn conflicts_resume_existing_submissions() -> anyhow::Result<()> {
+        for status in ["included", "queued"] {
+            let server = Server::new(move |path, _| {
+                Some(if path == "/relay/submit" {
+                    (409, serde_json::json!({"requestId":"existing","status":status}))
+                } else {
+                    assert_eq!(path, "/relay/submission/existing/status");
+                    (200, serde_json::json!({"requestId":"existing","status":"included"}))
+                })
+            })
+            .await;
+            let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+            let existing = client
+                .submit(
+                    curvy_abi::RelayAction::Aggregation,
+                    100,
+                    2,
+                    &proof(),
+                    &[],
+                    "request",
+                    "spend",
+                    "intent",
+                )
+                .await?;
+            assert_eq!(existing.request_id, "existing");
+            assert!(
+                client
+                    .await_inclusion(existing, Duration::from_secs(5))
+                    .await?
+                    .status
+                    .is_on_chain()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_conflicts_remain_uncertain_and_other_client_errors_reject() -> anyhow::Result<()> {
+        for code in [409, 400] {
+            let server = Server::new(move |_, _| Some((code, serde_json::json!({"error":"bad request"})))).await;
+            let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+            let error = client
+                .submit(
+                    curvy_abi::RelayAction::Aggregation,
+                    100,
+                    2,
+                    &proof(),
+                    &[],
+                    "request",
+                    "spend",
+                    "intent",
+                )
+                .await
+                .unwrap_err();
+            if code == 409 {
+                assert!(matches!(error, RelayError::Transport(_)));
+            } else {
+                assert!(matches!(error, RelayError::Rejected(_)));
+            }
+        }
+        Ok(())
     }
 }

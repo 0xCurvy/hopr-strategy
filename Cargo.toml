@@ -156,6 +156,9 @@ test-log = { workspace = true, features = ["trace"] }
 tokio = { workspace = true, features = [
   "macros",
   "rt-multi-thread",
+  "net",
+  "io-util",
+  "test-util",
   "tracing",
 ] }
 
