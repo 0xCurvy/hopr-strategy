@@ -1550,3 +1550,29 @@ async fn unconfirmed_sdk_funding_never_resets_the_pool() -> anyhow::Result<()> {
     harness.pool.generate_deposit_data(&id).await?;
     Ok(())
 }
+
+#[test]
+fn invalid_watch_owners_cannot_hide_valid_notes() -> anyhow::Result<()> {
+    // Serde accepts these bytes even though the checked point conversion rejects them.
+    let invalid: BjjPublicKey = serde_json::from_value(serde_json::json!(vec![255u8; 32]))?;
+    assert!(super::detect::bjj_point(&invalid).is_err());
+    let fixture = owned_candidate(1)?;
+    let detected = fixture
+        .detector
+        .detect_owned_note(
+            &fixture.note,
+            &[
+                (pix_id(2), invalid, fixture.scan_secret.clone()),
+                (fixture.id, fixture.address, fixture.scan_secret.clone()),
+            ],
+        )?
+        .expect("invalid local owner must not quarantine the valid public event");
+    assert_eq!(detected.deposit.id, fixture.id);
+
+    let dir = tempfile::tempdir()?;
+    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("state.redb"))?);
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
+    assert!(tracker.watch(pix_id(3), invalid, fixture.scan_secret, ten()).is_err());
+    assert!(tracker.watched_allocations().is_empty());
+    Ok(())
+}

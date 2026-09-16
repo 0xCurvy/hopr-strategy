@@ -41,7 +41,7 @@ use hopr_api::{
 };
 
 use super::{
-    detect::{CurvyDetectionError, RsCoreCurvyNoteDetector},
+    detect::{CurvyDetectionError, RsCoreCurvyNoteDetector, bjj_point},
     state::{CurvyDepositState, CurvyEventKind, CurvyStateError, cursor_component, note_id_key},
 };
 
@@ -212,6 +212,7 @@ where
         scan_secret: CurvyScanSecret,
         minimum: HoprBalance,
     ) -> Result<futures::channel::oneshot::Receiver<HoprBalance>, CurvyStateError> {
+        bjj_point(&address).map_err(|error| CurvyStateError::Corrupt(format!("invalid watch owner: {error}")))?;
         let (sender, receiver) = futures::channel::oneshot::channel();
         // Serialize the persisted-state check with completion notifications. This
         // prevents a completion from landing between the check and waiter insert.
