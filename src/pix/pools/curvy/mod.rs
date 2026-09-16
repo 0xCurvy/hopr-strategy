@@ -72,9 +72,9 @@
 //!   in production, `https://api.curvy.dev` for staging. No default: pointing a misconfigured node at a production
 //!   relayer is worse than refusing to start.
 //! * The **Curvy operator key**, from the environment variable named by [`CurvyDepositPoolConfig::operator_key_env`] —
-//!   **only under `submission: operator`**, where it signs and pays for allocations, withdrawals and note commitments.
-//!   A relayed node needs no EVM key of its own: the relayer submits, the batch-prover commits, and the shield is
-//!   signed by the node's existing chain key.
+//!   **under `submission: operator` or `shielding: portal`**: portal deployment is always self-signed. A relayed node
+//!   using direct shielding needs no additional EVM key: the relayer submits, the batch-prover commits, and the shield
+//!   is signed by the node's existing chain key.
 //! * The Curvy **proving artifacts**: every allocation, commitment and withdrawal is a Groth16 proof made in-process,
 //!   and the SDK loads each circuit's zkey and witness graph from `CURVY_ZK_KEYS_DIR` (flat, one zkey and one
 //!   `*.signet.zst` graph per circuit, digest-checked; a `CURVY_*_ZKEY` / `CURVY_*_GRAPH` pair per circuit overrides
@@ -852,17 +852,17 @@ where
         // After the overrides, so an env-selected mode is judged rather than the file's default.
         validate_mode_requirements(&cfg)?;
 
-        // The operator key signs proofs only when this node submits them itself. A relayed node
-        // needs no EVM key of its own: the relayer submits aggregations and withdrawals, the
-        // deployment's batch-prover commits, and the shield is paid by the Safe.
-        let operator_key = match cfg.submission {
-            CurvySubmission::Operator => std::env::var(&cfg.operator_key_env).map_err(|_| {
+        // Portal deployment is self-signed even when proofs go through the relayer.
+        let operator_key = if cfg.submission == CurvySubmission::Operator || cfg.shielding == CurvyShielding::Portal {
+            std::env::var(&cfg.operator_key_env).map_err(|_| {
                 StrategyError::InvalidConfiguration(format!(
-                    "environment variable {} must hold the Curvy operator's private key when submission is `operator`",
+                    "environment variable {} must hold a valid Curvy signing key for operator submission or portal \
+                     shielding",
                     cfg.operator_key_env
                 ))
-            })?,
-            CurvySubmission::Relayer => String::new(),
+            })?
+        } else {
+            String::new()
         };
         let initial_funding = match std::env::var(INITIAL_FUNDING_ENV) {
             Ok(raw) => HoprBalance::from_str(&raw).map_err(|error| {

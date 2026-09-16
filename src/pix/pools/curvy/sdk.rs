@@ -128,8 +128,7 @@ pub trait CurvySdkAdapter: Send + Sync + 'static {
 
     /// Whether the chain still knows the notes this adapter believes it owns.
     ///
-    /// `false` means the durable state describes a different chain than the one behind the
-    /// endpoint (a re-created development chain, typically) and must be discarded.
+    /// `false` can mean the endpoint is behind. It never authorizes discarding recovery state.
     async fn chain_state_is_consistent(&self) -> Result<bool, Self::Error>;
 
     /// Discards everything chain-specific, keeping only the node's Curvy identity.
@@ -141,9 +140,8 @@ pub struct RsSdkCurvyAdapterConfig {
     /// Curvy operator EVM key: role-gated portal deployment and pending-note commitment, and the
     /// submitter of allocation and withdrawal calls.
     ///
-    /// Empty under [`CurvySubmission::Relayer`], where none of those are this node's to sign —
-    /// see [`Self::submission`]. Every use is gated on the mode, so an empty key is never
-    /// presented to the SDK.
+    /// Required for operator submission or portal shielding. Empty only when direct shielding
+    /// is paired with relayed proof submission.
     pub operator_private_key: String,
     /// Token identifier used by all pool notes.
     pub token: u64,
@@ -209,6 +207,17 @@ impl RsSdkCurvyAdapterConfig {
         self.submission = submission;
         self.relayer_url = relayer_url;
         self
+    }
+
+    fn validate_signer(&self) -> Result<(), RsSdkCurvyAdapterError> {
+        if self.submission == CurvySubmission::Operator || self.shielding == CurvyShielding::Portal {
+            curvy_abi::address_of(&self.operator_private_key).map_err(|_| {
+                RsSdkCurvyAdapterError::InvalidValue(
+                    "a valid EVM signing key is required for operator submission or portal shielding".to_owned(),
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// Whether this node commits its own pending notes.
@@ -652,6 +661,7 @@ where
         relay: Option<Arc<RelayClient>>,
         state: &RedbCurvyDepositState,
     ) -> Result<Self, RsSdkCurvyAdapterError> {
+        config.validate_signer()?;
         let store = RedbCurvySdkStore::new(state)?;
         let mut persisted = store.load()?;
         let spender = match &persisted.spender {
@@ -1575,13 +1585,38 @@ mod tests {
     type Adapter = RsSdkCurvyAdapter<blokli_client::BlokliClient>;
 
     #[test]
+    fn portal_signer_is_required_independently_of_submission_mode() {
+        for shielding in [CurvyShielding::Direct, CurvyShielding::Portal] {
+            for submission in [CurvySubmission::Operator, CurvySubmission::Relayer] {
+                let needs_key = shielding == CurvyShielding::Portal || submission == CurvySubmission::Operator;
+                for key in [
+                    "",
+                    "invalid",
+                    "0000000000000000000000000000000000000000000000000000000000000000",
+                ] {
+                    let cfg = RsSdkCurvyAdapterConfig::new(key.to_owned(), 3).with_modes(shielding, submission, None);
+                    assert_eq!(cfg.validate_signer().is_err(), needs_key);
+                }
+                let cfg = RsSdkCurvyAdapterConfig::new("01".repeat(32), 3).with_modes(shielding, submission, None);
+                assert!(cfg.validate_signer().is_ok());
+            }
+        }
+    }
+
+    #[test]
     fn the_gateway_fee_collector_becomes_a_sealing_identity() -> anyhow::Result<()> {
         // Curvy staging's `/protocol` fee collector, whose owner key is the Gnosis aggregator's
         // `feeNotePublicKey`.
         let keys = relayer::CurvyPublicKeys {
-            spend_public_key: "98196467739045737361624042364526845165893723256538881225564237194894305749964.85819546747324778252702861357825104568382762224457080263515028979058114370157".to_owned(),
-            view_public_key: "21579150582945393796432405977169743203548565927228117293904839000735742388195.2199873391156304912266865805931783414728595814770346143973990126650821750981".to_owned(),
-            bjj_public_key: "6696655508272513187635510409223451359447854228192370110374659020120287021020.14667705991255323606553352965901746640607929945787383727539340760340072797708".to_owned(),
+            spend_public_key: "98196467739045737361624042364526845165893723256538881225564237194894305749964.\
+                               85819546747324778252702861357825104568382762224457080263515028979058114370157"
+                .to_owned(),
+            view_public_key: "21579150582945393796432405977169743203548565927228117293904839000735742388195.\
+                              2199873391156304912266865805931783414728595814770346143973990126650821750981"
+                .to_owned(),
+            bjj_public_key: "6696655508272513187635510409223451359447854228192370110374659020120287021020.\
+                             14667705991255323606553352965901746640607929945787383727539340760340072797708"
+                .to_owned(),
         };
         let identity = stealth_identity(&keys, "the protocol fee collector's key")?;
         assert_eq!(identity.big_k, keys.spend_public_key);
