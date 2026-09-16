@@ -236,6 +236,13 @@ impl RsSdkCurvyAdapterConfig {
 pub enum RsSdkCurvyAdapterError {
     #[error(transparent)]
     Sdk(#[from] anyhow::Error),
+    #[error(transparent)]
+    Relay(#[from] relayer::RelayError),
+    #[error(
+        "a legacy relayer aggregation lacks saved output notes; preserve this database and recover its intent before \
+         spending"
+    )]
+    IncompleteRelayRecovery,
     #[error("invalid Curvy adapter value: {0}")]
     InvalidValue(String),
     #[error("the private pool has no committed note large enough to fund {required} wei")]
@@ -323,6 +330,27 @@ struct StoredRelayIntent {
     action: String,
     /// What the submission spends, so a resolved intent can be matched to its allocations.
     spend_key: String,
+}
+
+/// Everything needed to replay the same proof and recover its private change after a crash.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredRelayAggregation {
+    intent: String,
+    chain_id: u64,
+    aggregator: String,
+    max_inputs: usize,
+    proof: curvy_abi::curvy_types::Groth16Proof,
+    public_signals: Vec<String>,
+    request_key: String,
+    spend_key: String,
+    inputs: Vec<StoredNote>,
+    change: StoredNote,
+    emitted: Vec<StoredNote>,
+    allocation_ids: Vec<[u8; PixAddressId::SIZE]>,
+    /// Written before POST. Only a first-attempt rejection can safely release the inputs.
+    attempted: bool,
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 /// A direct shield in flight.
@@ -439,6 +467,8 @@ struct SdkState {
     /// received, where a `requestId` we never saw would tell us nothing.
     #[serde(default)]
     relay_intents: Vec<StoredRelayIntent>,
+    #[serde(default)]
+    relay_aggregation: Option<StoredRelayAggregation>,
     /// Read only for atomic migration of databases written before the keyed table.
     #[serde(default, rename = "allocations", skip_serializing)]
     legacy_allocations: Vec<StoredAllocation>,
@@ -566,8 +596,8 @@ fn stealth_identity(keys: &relayer::CurvyPublicKeys, who: &str) -> Result<Identi
     })
 }
 
-fn relay_error(error: impl std::fmt::Display) -> RsSdkCurvyAdapterError {
-    RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(error.to_string()))
+fn relay_error(error: relayer::RelayError) -> RsSdkCurvyAdapterError {
+    RsSdkCurvyAdapterError::Relay(error)
 }
 
 /// A random v4 UUID, which is the only shape the relayer accepts for an intent id.
@@ -899,6 +929,7 @@ where
     async fn shield(&self, gross: u128, recovery_address: &str) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
         let _chain = self.chain.lock().await;
         let (client, endpoints) = self.client().await?;
+        self.reconcile_relay_aggregation().await?;
         self.recover_pending().await?;
         let already_funded = {
             let state = self.state.lock();
@@ -1147,6 +1178,172 @@ where
             .transpose()
     }
 
+    fn prepare_relay_aggregation(
+        &self,
+        request: &curvy_sdk::PixAggregationRequest,
+        endpoints: &CurvyChainEndpoints,
+        inputs: &[OwnedNote],
+        allocations: &[StoredAllocation],
+    ) -> Result<(), RsSdkCurvyAdapterError> {
+        let mut current = self.state.lock();
+        if current.relay_aggregation.is_some() {
+            return Err(RsSdkCurvyAdapterError::AmbiguousAllocation);
+        }
+        let mut next = current.clone();
+        next.relay_aggregation = Some(StoredRelayAggregation {
+            intent: uuid_v4(),
+            chain_id: endpoints.chain_id,
+            aggregator: endpoints.aggregator.clone(),
+            max_inputs: request.max_inputs,
+            proof: request.proof.clone(),
+            public_signals: request.public_signals.clone(),
+            request_key: request.request_key.clone(),
+            spend_key: request.spend_key.clone(),
+            inputs: inputs.iter().map(StoredNote::from).collect(),
+            change: StoredNote::from(&request.change),
+            emitted: request
+                .emitted_notes
+                .iter()
+                .filter(|note| note.amount != Fr::from(0u8))
+                .map(StoredNote::from)
+                .collect(),
+            allocation_ids: allocations.iter().map(|row| row.id).collect(),
+            attempted: false,
+            request_id: None,
+        });
+        self.store.save_update(&next, allocations, &[])?;
+        *current = next;
+        Ok(())
+    }
+
+    /// A shared spend key alone does not prove that a conflicting submission has our outputs.
+    async fn relay_outputs_known(&self, pending: &StoredRelayAggregation) -> Result<bool, RsSdkCurvyAdapterError> {
+        if pending.emitted.is_empty() {
+            return Ok(false);
+        }
+        let (client, _) = self.client().await?;
+        for stored in &pending.emitted {
+            let note = OwnedNote::try_from(stored)?;
+            if !matches!(client.note_status(&note.note_id()).await?, 1 | 2) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn finish_relay_aggregation(&self, included: bool) -> Result<(), RsSdkCurvyAdapterError> {
+        let mut current = self.state.lock();
+        let Some(pending) = current.relay_aggregation.as_ref() else {
+            return Ok(());
+        };
+        let mut next = current.clone();
+        let completed = if included {
+            next.funding.retain(|note| !pending.inputs.contains(note));
+            if OwnedNote::try_from(&pending.change)?.amount != Fr::from(0u8) {
+                next.funding.push(pending.change.clone());
+            }
+            next.pending.extend(pending.emitted.clone());
+            self.store.completed_allocations(&pending.allocation_ids)?
+        } else {
+            Vec::new()
+        };
+        next.relay_aggregation = None;
+        let remove = if included { &[][..] } else { &pending.allocation_ids[..] };
+        self.store.save_update(&next, &completed, remove)?;
+        *current = next;
+        Ok(())
+    }
+
+    /// Called with the chain lock held, including on startup and before any funding operation.
+    async fn reconcile_relay_aggregation(&self) -> Result<(), RsSdkCurvyAdapterError> {
+        let pending = {
+            let state = self.state.lock();
+            if state
+                .relay_intents
+                .iter()
+                .any(|intent| intent.action.eq_ignore_ascii_case("aggregation"))
+            {
+                return Err(RsSdkCurvyAdapterError::IncompleteRelayRecovery);
+            }
+            state.relay_aggregation.clone()
+        };
+        let Some(mut pending) = pending else {
+            return Ok(());
+        };
+        let (_, endpoints) = self.client().await?;
+        if endpoints.chain_id != pending.chain_id || !endpoints.aggregator.eq_ignore_ascii_case(&pending.aggregator) {
+            return Err(RsSdkCurvyAdapterError::InvalidValue(
+                "pending aggregation belongs to another deployment".to_owned(),
+            ));
+        }
+        if pending.attempted && self.relay_outputs_known(&pending).await? {
+            return self.finish_relay_aggregation(true);
+        }
+        let relay = self.relay.as_ref().ok_or_else(|| {
+            RsSdkCurvyAdapterError::InvalidValue("configure the relayer to recover the pending aggregation".to_owned())
+        })?;
+        let known = if let Some(id) = &pending.request_id {
+            Some(relay.status(id).await?)
+        } else if pending.attempted {
+            relay.by_intent(&pending.intent, pending.chain_id).await?
+        } else {
+            None
+        };
+        let submission = if let Some(known) = known {
+            known
+        } else {
+            let was_attempted = pending.attempted;
+            pending.attempted = true;
+            {
+                let mut current = self.state.lock();
+                let mut next = current.clone();
+                next.relay_aggregation = Some(pending.clone());
+                self.store.save(&next)?;
+                *current = next;
+            }
+            match relay
+                .submit(
+                    curvy_abi::RelayAction::Aggregation,
+                    pending.chain_id,
+                    pending.max_inputs,
+                    &pending.proof,
+                    &pending.public_signals,
+                    &pending.request_key,
+                    &pending.spend_key,
+                    &pending.intent,
+                )
+                .await
+            {
+                Ok(submission) => submission,
+                Err(error) => {
+                    if !was_attempted && matches!(error, relayer::RelayError::Rejected(_)) {
+                        self.finish_relay_aggregation(false)?;
+                    }
+                    return Err(error.into());
+                }
+            }
+        };
+        pending.request_id = Some(submission.request_id.clone());
+        {
+            let mut current = self.state.lock();
+            let mut next = current.clone();
+            next.relay_aggregation = Some(pending.clone());
+            self.store.save(&next)?;
+            *current = next;
+        }
+        if let Err(error) = relay.await_inclusion(submission, self.config.relay_timeout).await {
+            if matches!(error, relayer::RelayError::Failed(_)) {
+                self.finish_relay_aggregation(false)?;
+            }
+            return Err(error.into());
+        }
+        if !self.relay_outputs_known(&pending).await? {
+            // A lagging index or a conflicting request with other outputs is not completion.
+            return Err(RsSdkCurvyAdapterError::AmbiguousAllocation);
+        }
+        self.finish_relay_aggregation(true)
+    }
+
     /// Records an intent before submitting under it, and clears it once the outcome is known.
     fn journal_intent(&self, intent: &str, action: &str, spend_key: &str) -> Result<(), RsSdkCurvyAdapterError> {
         let mut state = self.state.lock();
@@ -1248,7 +1445,9 @@ where
     ) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
         let _chain = self.chain.lock().await;
         let (client, endpoints) = self.client().await?;
-        if self.state.lock().ambiguous_allocation && !self.reconcile_ambiguous_allocation().await? {
+        self.reconcile_relay_aggregation().await?;
+        let ambiguous = self.state.lock().ambiguous_allocation;
+        if ambiguous && !self.reconcile_ambiguous_allocation().await? {
             return Err(RsSdkCurvyAdapterError::AmbiguousAllocation);
         }
         let deposits = {
@@ -1333,7 +1532,7 @@ where
                 .iter()
                 .map(|(id, address, scan_key, amount)| StoredAllocation::new(*id, address, *scan_key, *amount))
                 .collect::<Result<Vec<_>, _>>()?;
-            {
+            if self.config.submission == CurvySubmission::Operator {
                 let state = self.state.lock();
                 self.store.save_update(&state, &allocation_records, &[])?;
             }
@@ -1349,23 +1548,13 @@ where
                 .await;
             let aggregated = match aggregated {
                 Ok(request) => match (self.config.submission, self.relay.as_ref()) {
-                    (CurvySubmission::Relayer, Some(relay)) => {
-                        let outcome = self
-                            .relay_submit(
-                                relay,
-                                endpoints.chain_id,
-                                curvy_abi::RelayAction::Aggregation,
-                                request.max_inputs,
-                                &request.proof,
-                                &request.public_signals,
-                                &request.request_key,
-                                &request.spend_key,
-                            )
-                            .await;
-                        match outcome {
-                            Ok(()) => Ok(request.into_result_for_caller()),
-                            Err(error) => Err(anyhow::anyhow!("{error}")),
-                        }
+                    (CurvySubmission::Relayer, Some(_)) => {
+                        self.prepare_relay_aggregation(&request, endpoints, &funding_notes, &allocation_records)?;
+                        // Errors retain the exact request and its outputs. They must not enter
+                        // the operator SDK's generic cleanup path below.
+                        self.reconcile_relay_aggregation().await?;
+                        self.recover_pending().await?;
+                        continue;
                     }
                     _ => {
                         client
@@ -1583,6 +1772,8 @@ where
     }
 
     async fn chain_state_is_consistent(&self) -> Result<bool, Self::Error> {
+        let _chain = self.chain.lock().await;
+        self.reconcile_relay_aggregation().await?;
         let (funding, pending) = {
             let state = self.state.lock();
             (state.funding.clone(), state.pending.clone())
@@ -1819,6 +2010,262 @@ mod tests {
             adapter.allocate_all(&changed).await,
             Err(RsSdkCurvyAdapterError::ConflictingAllocation)
         ));
+        Ok(())
+    }
+
+    fn prepare_recovery_fixture(adapter: &Adapter) -> anyhow::Result<(StoredAllocation, StoredNote)> {
+        let record = stored_fixture(7)?;
+        let mut input = Adapter::owned_note(&fixture(100))?;
+        input.shared_secret = Fr::from(101u64);
+        let mut change = input.clone();
+        change.amount = Fr::from(90u64);
+        change.shared_secret = Fr::from(102u64);
+        let allocated = Adapter::owned_note(&fixture(7))?;
+        let request = curvy_sdk::PixAggregationRequest {
+            proof: relayer::http_tests::proof(),
+            public_signals: vec!["1".to_owned()],
+            max_inputs: 2,
+            allocations: vec![allocated.clone()],
+            change: change.clone(),
+            relayer: None,
+            emitted_notes: vec![allocated, change.clone()],
+            request_key: "exact-proof".to_owned(),
+            spend_key: "same-inputs".to_owned(),
+        };
+        {
+            let mut state = adapter.state.lock();
+            state.funding = vec![StoredNote::from(&input)];
+            adapter.store.save(&state)?;
+        }
+        adapter.prepare_relay_aggregation(
+            &request,
+            &adapter.client.get().unwrap().1,
+            &[input],
+            std::slice::from_ref(&record),
+        )?;
+        Ok((record, StoredNote::from(&change)))
+    }
+
+    fn note_status_response(known: bool) -> (u16, serde_json::Value) {
+        (
+            200,
+            serde_json::json!({"data":{"curvyNoteStatus":{"__typename":"CurvyNoteStatus","status":if known {2} else {0}}}}),
+        )
+    }
+
+    #[tokio::test]
+    async fn relayed_aggregations_recover_after_uncertain_responses_and_restart() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for failure in ["lost_post", "poll_error", "timeout", "missing_intent"] {
+            let recovering = Arc::new(AtomicBool::new(false));
+            let landed = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let server = relayer::http_tests::Server::new({
+                let recovering = recovering.clone();
+                let landed = landed.clone();
+                let requests = requests.clone();
+                move |path, body| {
+                    if path == "/graphql" {
+                        return Some(note_status_response(landed.load(Ordering::SeqCst)));
+                    }
+                    if path == "/relay/submit" {
+                        requests.lock().push(body);
+                        if recovering.load(Ordering::SeqCst) {
+                            landed.store(true, Ordering::SeqCst);
+                            return Some((200, serde_json::json!({"requestId":"saved","status":"included"})));
+                        }
+                        if failure == "lost_post" || failure == "missing_intent" {
+                            return None;
+                        }
+                        return Some((200, serde_json::json!({"requestId":"saved","status":"queued"})));
+                    }
+                    if recovering.load(Ordering::SeqCst) {
+                        if failure == "missing_intent" && path.starts_with("/relay/intent/") {
+                            return Some((404, serde_json::Value::Null));
+                        }
+                        landed.store(true, Ordering::SeqCst);
+                        return Some((200, serde_json::json!({"requestId":"saved","status":"included"})));
+                    }
+                    Some((500, serde_json::json!({"error":"temporarily unavailable"})))
+                }
+            })
+            .await;
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("state.redb");
+            let state = RedbCurvyDepositState::open(&path)?;
+            let mut adapter = test_adapter(&state, server.url.clone())?;
+            if failure == "timeout" {
+                adapter.config.relay_timeout = std::time::Duration::ZERO;
+            }
+            let (record, change) = prepare_recovery_fixture(&adapter)?;
+            let before = adapter.store.load()?.relay_aggregation.unwrap();
+            assert!(!before.attempted);
+            let result = adapter.reconcile_relay_aggregation().await;
+            assert!(
+                matches!(result, Err(RsSdkCurvyAdapterError::Relay(_))),
+                "{failure}: {result:?}"
+            );
+            let durable = adapter.store.load()?;
+            let pending = durable.relay_aggregation.unwrap();
+            assert_eq!(pending.change, change);
+            assert_eq!(pending.intent, before.intent);
+            assert_eq!(pending.inputs, durable.funding);
+            assert_eq!(
+                adapter.store.allocation(&record.id)?.unwrap().stage,
+                StoredAllocationStage::Prepared
+            );
+            drop(adapter);
+            drop(state);
+
+            // The restarted process loads every output before checking status or retransmitting.
+            recovering.store(true, Ordering::SeqCst);
+            let state = RedbCurvyDepositState::open(&path)?;
+            let adapter = test_adapter(&state, server.url.clone())?;
+            adapter.reconcile_relay_aggregation().await?;
+            let recovered = adapter.store.load()?;
+            assert!(recovered.relay_aggregation.is_none());
+            assert_eq!(recovered.funding, vec![change]);
+            assert_eq!(
+                adapter.store.allocation(&record.id)?.unwrap().stage,
+                StoredAllocationStage::Completed
+            );
+            adapter.reconcile_relay_aggregation().await?;
+            assert_eq!(adapter.store.load()?.funding, recovered.funding);
+            let sent = requests.lock();
+            if failure == "missing_intent" {
+                assert_eq!(sent.len(), 2);
+                assert_eq!(sent[0], sent[1]);
+            } else {
+                assert_eq!(sent.len(), 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relayed_aggregation_is_durable_before_post_and_recovers_without_the_relayer() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let state = RedbCurvyDepositState::in_memory()?;
+        let landed = Arc::new(AtomicBool::new(false));
+        let server = relayer::http_tests::Server::new({
+            let db = state.shared_database();
+            let landed = landed.clone();
+            move |path, _| {
+                if path == "/graphql" {
+                    return Some(note_status_response(landed.load(Ordering::SeqCst)));
+                }
+                let store = RedbCurvySdkStore { db: db.clone() };
+                let pending = store.load().unwrap().relay_aggregation.unwrap();
+                assert!(pending.attempted);
+                assert!(!pending.inputs.is_empty());
+                assert!(!pending.emitted.is_empty());
+                assert_eq!(
+                    store.allocation(&pending.allocation_ids[0]).unwrap().unwrap().stage,
+                    StoredAllocationStage::Prepared
+                );
+                // The transaction lands, but the process gets no response to save.
+                landed.store(true, Ordering::SeqCst);
+                None
+            }
+        })
+        .await;
+        let adapter = test_adapter(&state, server.url.clone())?;
+        let (_, change) = prepare_recovery_fixture(&adapter)?;
+        assert!(adapter.reconcile_relay_aggregation().await.is_err());
+        drop(adapter);
+        let adapter = test_adapter(&state, server.url.clone())?;
+        adapter.reconcile_relay_aggregation().await?;
+        assert_eq!(adapter.store.load()?.funding, vec![change]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relayed_conflict_with_other_outputs_never_replaces_funding() -> anyhow::Result<()> {
+        let server = relayer::http_tests::Server::new(|path, _| {
+            Some(if path == "/graphql" {
+                note_status_response(false)
+            } else {
+                (
+                    if path == "/relay/submit" { 409 } else { 200 },
+                    serde_json::json!({"requestId":"other","status":"included"}),
+                )
+            })
+        })
+        .await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = test_adapter(&state, server.url.clone())?;
+        let (record, _) = prepare_recovery_fixture(&adapter)?;
+        let original = adapter.store.load()?.funding;
+        assert!(matches!(
+            adapter.reconcile_relay_aggregation().await,
+            Err(RsSdkCurvyAdapterError::AmbiguousAllocation)
+        ));
+        assert!(adapter.store.load()?.relay_aggregation.is_some());
+        assert_eq!(adapter.store.load()?.funding, original);
+        assert_eq!(
+            adapter.store.allocation(&record.id)?.unwrap().stage,
+            StoredAllocationStage::Prepared
+        );
+        // A new operation must stop at recovery rather than reusing the old inputs.
+        assert!(matches!(
+            adapter.allocate_all(&[]).await,
+            Err(RsSdkCurvyAdapterError::AmbiguousAllocation)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relayed_initial_rejection_releases_prepared_allocations() -> anyhow::Result<()> {
+        let server =
+            relayer::http_tests::Server::new(|_, _| Some((400, serde_json::json!({"error":"invalid proof"})))).await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = test_adapter(&state, server.url.clone())?;
+        let (record, _) = prepare_recovery_fixture(&adapter)?;
+        let original = adapter.store.load()?.funding;
+        assert!(matches!(
+            adapter.reconcile_relay_aggregation().await,
+            Err(RsSdkCurvyAdapterError::Relay(relayer::RelayError::Rejected(_)))
+        ));
+        assert!(adapter.store.load()?.relay_aggregation.is_none());
+        assert!(adapter.store.allocation(&record.id)?.is_none());
+        assert_eq!(adapter.store.load()?.funding, original);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relayed_terminal_failure_releases_inputs_without_losing_funding() -> anyhow::Result<()> {
+        let server = relayer::http_tests::Server::new(|_, _| {
+            Some((
+                200,
+                serde_json::json!({"requestId":"failed","status":"failed","error":"transaction reverted"}),
+            ))
+        })
+        .await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = test_adapter(&state, server.url.clone())?;
+        let (record, _) = prepare_recovery_fixture(&adapter)?;
+        let original = adapter.store.load()?.funding;
+        assert!(matches!(
+            adapter.reconcile_relay_aggregation().await,
+            Err(RsSdkCurvyAdapterError::Relay(relayer::RelayError::Failed(_)))
+        ));
+        assert!(adapter.store.load()?.relay_aggregation.is_none());
+        assert!(adapter.store.allocation(&record.id)?.is_none());
+        assert_eq!(adapter.store.load()?.funding, original);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_relay_metadata_cannot_be_silently_discarded() -> anyhow::Result<()> {
+        let server = relayer::http_tests::Server::new(|_, _| panic!("legacy recovery must fail before spending")).await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = test_adapter(&state, server.url.clone())?;
+        adapter.journal_intent("legacy", "aggregation", "inputs")?;
+        assert!(matches!(
+            adapter.reconcile_relay_aggregation().await,
+            Err(RsSdkCurvyAdapterError::IncompleteRelayRecovery)
+        ));
+        assert_eq!(adapter.store.load()?.relay_intents.len(), 1);
         Ok(())
     }
 
