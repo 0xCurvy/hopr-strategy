@@ -322,7 +322,22 @@ impl RedbCurvyDepositState {
     /// The path must be reused across restarts; an ephemeral path loses the private note state
     /// that makes committed deposits sweepable.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CurvyStateError> {
-        let db = redb::Database::create(path).map_err(state_db_error)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path).map_err(state_db_error)?;
+        // Set permissions on the same handle redb will use, including on an existing file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(state_db_error)?;
+        }
+        let db = redb::Database::builder().create_file(file).map_err(state_db_error)?;
         let write = db.begin_write().map_err(state_db_error)?;
         write.open_table(CURSOR_TABLE).map_err(state_db_error)?;
         write.open_table(OWNED_NOTES_TABLE).map_err(state_db_error)?;
@@ -557,5 +572,38 @@ impl CurvyDepositState for RedbCurvyDepositState {
         write.open_table(NOTE_SESSIONS_TABLE).map_err(state_db_error)?;
         write.open_table(SCAN_SECRETS_TABLE).map_err(state_db_error)?;
         write.commit().map_err(state_db_error)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permission_tests {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+
+    use super::*;
+
+    #[test]
+    fn database_is_private() -> anyhow::Result<()> {
+        const CHILD_PATH: &str = "CURVY_PERMISSION_TEST_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            drop(RedbCurvyDepositState::open(&path)?);
+            assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+            drop(RedbCurvyDepositState::open(&path)?);
+            assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+            return Ok(());
+        }
+        // Changing umask in this process would race the other tests.
+        let dir = tempfile::tempdir()?;
+        let status = Command::new("sh")
+            .args(["-c", "umask 022; exec \"$@\"", "curvy-permissions"])
+            .arg(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "pix::pools::curvy::state::permission_tests::database_is_private",
+            ])
+            .env(CHILD_PATH, dir.path().join("state.redb"))
+            .status()?;
+        assert!(status.success());
+        Ok(())
     }
 }
