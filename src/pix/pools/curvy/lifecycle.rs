@@ -53,15 +53,30 @@ const QUERY_PAGE_SIZE: u32 = 1_000;
 /// interval. Blokli answers these pages locally, so the cost of asking often is small.
 const RECONNECT_DELAY: Duration = Duration::from_millis(250);
 
+/// A pending-note traversal step. Snapshot sources return their entire pinned snapshot
+/// with `has_more = false`; event streams can continue from the last note's cursor.
+pub struct PendingNotesPage {
+    pub notes: Vec<CurvyPendingNote>,
+    pub has_more: bool,
+}
+
+impl PendingNotesPage {
+    pub fn paged(notes: Vec<CurvyPendingNote>, first: u32) -> Self {
+        Self {
+            has_more: notes.len() == first as usize,
+            notes,
+        }
+    }
+}
+
 /// The slice of Blokli's Curvy API that discovery reads through.
 ///
 /// Narrow on purpose: it is what a test has to fake to drive the whole pool without a Blokli, and
 /// it is implemented for any [`BlokliQueryClient`] by [`BlokliIndex`].
 #[async_trait]
 pub trait CurvyIndexSource: Send + Sync + 'static {
-    /// One page of pending notes strictly after `after`, oldest first.
-    async fn pending_notes(&self, after: Option<CurvyEventCursor>, first: u32)
-    -> Result<Vec<CurvyPendingNote>, String>;
+    /// Pending events after `after`, or one complete pinned snapshot for snapshot sources.
+    async fn pending_notes(&self, after: Option<CurvyEventCursor>, first: u32) -> Result<PendingNotesPage, String>;
 
     /// One page of committed notes strictly after `after`, oldest first.
     async fn committed_notes(
@@ -102,15 +117,11 @@ impl<C> CurvyIndexSource for BlokliIndex<C>
 where
     C: BlokliQueryClient + Send + Sync + 'static,
 {
-    async fn pending_notes(
-        &self,
-        after: Option<CurvyEventCursor>,
-        first: u32,
-    ) -> Result<Vec<CurvyPendingNote>, String> {
+    async fn pending_notes(&self, after: Option<CurvyEventCursor>, first: u32) -> Result<PendingNotesPage, String> {
         self.0
             .query_curvy_pending_notes(None, after, first)
             .await
-            .map(|page| page.notes)
+            .map(|page| PendingNotesPage::paged(page.notes, first))
             .map_err(|error| error.to_string())
     }
 
@@ -391,7 +402,11 @@ where
 }
 
 /// One catch-up pass over both event families. See the module docs for the ordering.
-async fn catch_up<I, S>(client: &I, tracker: &CurvyLifecycleTracker<S>, replay_history: bool) -> Result<(), String>
+pub(super) async fn catch_up<I, S>(
+    client: &I,
+    tracker: &CurvyLifecycleTracker<S>,
+    replay_history: bool,
+) -> Result<(), String>
 where
     I: CurvyIndexSource,
     S: CurvyDepositState,
@@ -401,8 +416,8 @@ where
         .map_err(|error| error.to_string())?;
     loop {
         let page = client.pending_notes(pending_after.clone(), QUERY_PAGE_SIZE).await?;
-        let page_len = page.len();
-        for note in page {
+        let has_more = page.has_more;
+        for note in page.notes {
             pending_after = Some(CurvyEventCursor::from(&note.position));
             if !tracker
                 .process_candidate(note)
@@ -412,7 +427,7 @@ where
                 return Ok(());
             }
         }
-        if page_len < QUERY_PAGE_SIZE as usize {
+        if !has_more {
             break;
         }
     }

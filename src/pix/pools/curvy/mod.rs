@@ -129,7 +129,7 @@ use hopr_api::{
         primitive::prelude::{Address, HoprBalance, IntoEndian, U256},
     },
 };
-pub use lifecycle::{BlokliIndex, CurvyIndexSource};
+pub use lifecycle::{BlokliIndex, CurvyIndexSource, PendingNotesPage};
 pub use sdk::{
     CurvyChainEndpoints, CurvySdkAdapter, DirectShielder, PortalFunder, RsSdkCurvyAdapter, RsSdkCurvyAdapterConfig,
     RsSdkCurvyAdapterError,
@@ -740,7 +740,7 @@ impl CurvyIndexSource for NoteIndex {
         &self,
         after: Option<blokli_client::api::types::CurvyEventCursor>,
         first: u32,
-    ) -> Result<Vec<blokli_client::api::types::CurvyPendingNote>, String> {
+    ) -> Result<PendingNotesPage, String> {
         match self {
             Self::Blokli(index) => index.pending_notes(after, first).await,
             Self::CurvyIndexer(index) => index.pending_notes(after, first).await,

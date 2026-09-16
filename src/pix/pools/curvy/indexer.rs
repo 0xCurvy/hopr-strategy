@@ -51,7 +51,7 @@ use curvy_types::{CommittedNotesEvent, CommittedNullifiersEvent, NotesTreeSnapsh
 use hopr_api::types::primitive::prelude::U256;
 use serde::Deserialize;
 
-use super::lifecycle::CurvyIndexSource;
+use super::lifecycle::{CurvyIndexSource, PendingNotesPage};
 
 /// Largest page the indexer serves (`limit` is capped at 2000 server-side).
 const PAGE_SIZE: u32 = 2000;
@@ -413,13 +413,18 @@ impl<A: SyncApi> CurvyIndexerClient<A> {
         if first.next_index >= first.total {
             return Ok(first.items);
         }
+        let mut from = first.next_index;
         let mut rows = first.items;
-        rows.extend(
-            self.all::<PendingRow>("/sync/pending", &first.checkpoint, first.total)
-                .await?
-                .into_iter()
-                .skip(rows.len()),
-        );
+        while from < first.total {
+            let page: Page<PendingRow> = self
+                .page("/sync/pending", from, PAGE_SIZE, Some(&first.checkpoint))
+                .await?;
+            if page.checkpoint != first.checkpoint || page.items.is_empty() || page.next_index <= from {
+                return Err("Curvy pending snapshot changed checkpoint or stopped advancing".to_owned());
+            }
+            from = page.next_index;
+            rows.extend(page.items);
+        }
         Ok(rows)
     }
 }
@@ -433,18 +438,14 @@ pub struct CurvyIndexerSource<A = HttpSyncApi>(pub CurvyIndexerClient<A>);
 
 #[async_trait]
 impl<A: SyncApi> CurvyIndexSource for CurvyIndexerSource<A> {
-    async fn pending_notes(
-        &self,
-        _after: Option<CurvyEventCursor>,
-        first: u32,
-    ) -> Result<Vec<CurvyPendingNote>, String> {
-        // Offsets over a shrinking set are not cursors; read the whole set (see module docs).
+    async fn pending_notes(&self, _after: Option<CurvyEventCursor>, _first: u32) -> Result<PendingNotesPage, String> {
         let rows = self.0.pending_all().await?;
-        rows.iter()
+        let notes = rows
+            .iter()
             .enumerate()
-            .take(first as usize)
             .map(|(index, row)| pending_note(row, index as u64))
-            .collect()
+            .collect::<Result<_, _>>()?;
+        Ok(PendingNotesPage { notes, has_more: false })
     }
 
     async fn committed_notes(
@@ -802,10 +803,66 @@ mod tests {
         );
     }
 
+    struct PagedPendingApi {
+        total: usize,
+        change_checkpoint: bool,
+    }
+
+    #[async_trait]
+    impl SyncApi for PagedPendingApi {
+        async fn get_json(&self, query: &str) -> Result<serde_json::Value, String> {
+            let url = Url::parse(&format!("http://localhost{query}")).unwrap();
+            let params = url.query_pairs().collect::<HashMap<_, _>>();
+            let from = params["fromIndex"].parse::<usize>().unwrap();
+            if from > 0 {
+                assert_eq!(params["at"], CHECKPOINT);
+            }
+            let end = (from + 2000).min(self.total);
+            let template = canned().0["/sync/pending"]["notes"][0].clone();
+            let notes = (from..end)
+                .map(|index| {
+                    let mut row = template.clone();
+                    row["noteId"] = serde_json::json!(format!("0x{:064x}", index + 1));
+                    row
+                })
+                .collect::<Vec<_>>();
+            Ok(serde_json::json!({
+                "checkpoint": if from > 0 && self.change_checkpoint { "changed" } else { CHECKPOINT },
+                "fromIndex": from, "nextIndex": end, "total": self.total, "notes": notes,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn full_pending_snapshots_finish_and_pin_later_pages() -> anyhow::Result<()> {
+        for total in [1000, 1001, 2001] {
+            let source = CurvyIndexerSource(CurvyIndexerClient::new(
+                PagedPendingApi {
+                    total,
+                    change_checkpoint: false,
+                },
+                Arc::new(42161u64),
+            ));
+            let page = source.pending_notes(None, 1000).await.map_err(anyhow::Error::msg)?;
+            assert_eq!(page.notes.len(), total);
+            assert!(!page.has_more);
+            assert_eq!(page.notes[total - 1].note_id.0, format!("0x{total:064x}"));
+        }
+        let source = CurvyIndexerSource(CurvyIndexerClient::new(
+            PagedPendingApi {
+                total: 2001,
+                change_checkpoint: true,
+            },
+            Arc::new(42161u64),
+        ));
+        assert!(source.pending_notes(None, 1000).await.is_err());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn pending_notes_carry_what_the_detector_scans() -> anyhow::Result<()> {
         let source = CurvyIndexerSource(client());
-        let notes = source.pending_notes(None, 100).await.map_err(anyhow::Error::msg)?;
+        let notes = source.pending_notes(None, 100).await.map_err(anyhow::Error::msg)?.notes;
         assert_eq!(notes.len(), 1);
         let note = &notes[0];
         assert_eq!(
@@ -827,7 +884,8 @@ mod tests {
             .pending_notes(Some(CurvyEventCursor::from(&note.position)), 100)
             .await
             .map_err(anyhow::Error::msg)?;
-        assert_eq!(again.len(), 1);
+        assert_eq!(again.notes.len(), 1);
+        assert!(!again.has_more);
         Ok(())
     }
 

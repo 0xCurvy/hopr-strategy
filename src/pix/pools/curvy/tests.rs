@@ -495,6 +495,7 @@ fn deposit_data_round_trips_through_the_wire_form() -> anyhow::Result<()> {
 /// A note index the test writes to directly, standing in for Blokli.
 #[derive(Default)]
 struct ScriptedIndex {
+    snapshot_pending: bool,
     pending: parking_lot::Mutex<Vec<CurvyPendingNote>>,
     /// Committed notes served as candidates, for a source whose pending view missed them.
     committed_candidates: parking_lot::Mutex<Vec<CurvyPendingNote>>,
@@ -530,16 +531,24 @@ impl CurvyIndexSource for ScriptedIndex {
         &self,
         after: Option<CurvyEventCursor>,
         first: u32,
-    ) -> Result<Vec<CurvyPendingNote>, String> {
+    ) -> Result<super::PendingNotesPage, String> {
+        if self.snapshot_pending {
+            return Ok(super::PendingNotesPage {
+                notes: self.pending.lock().clone(),
+                has_more: false,
+            });
+        }
         let after = after.as_ref().map(cursor_ordinal);
-        Ok(self
-            .pending
-            .lock()
-            .iter()
-            .filter(|note| after.is_none_or(|after| ordinal(&note.position) > after))
-            .take(first as usize)
-            .cloned()
-            .collect())
+        Ok(super::PendingNotesPage::paged(
+            self.pending
+                .lock()
+                .iter()
+                .filter(|note| after.is_none_or(|after| ordinal(&note.position) > after))
+                .take(first as usize)
+                .cloned()
+                .collect(),
+            first,
+        ))
     }
 
     async fn committed_notes(
@@ -1393,7 +1402,11 @@ async fn replay_detection_against_staging() -> anyhow::Result<()> {
             Err(error) => println!("  leaf {}: ERROR {error}", candidate.position.event_item_index.0),
         }
     }
-    let pending = source.pending_notes(None, 1000).await.map_err(anyhow::Error::msg)?;
+    let pending = source
+        .pending_notes(None, 1000)
+        .await
+        .map_err(anyhow::Error::msg)?
+        .notes;
     println!("{} pending", pending.len());
     for candidate in &pending {
         if let Ok(Some(note)) = detector.detect_owned_note(candidate, &watched) {
@@ -1460,7 +1473,7 @@ async fn staging_indexer_serves_gnosis_notes() -> anyhow::Result<()> {
     let (head, finality) = source.indexed_head().await.map_err(anyhow::Error::msg)?;
     println!("gnosis finalized head {head}, finality {finality}");
     assert!(head > 48_060_257, "past the aggregator's deployment block");
-    let pending = source.pending_notes(None, 10).await.map_err(anyhow::Error::msg)?;
+    let pending = source.pending_notes(None, 10).await.map_err(anyhow::Error::msg)?.notes;
     let committed = source.committed_notes(None, 10).await.map_err(anyhow::Error::msg)?;
     println!("pending {} committed {}", pending.len(), committed.len());
     let candidates = source
@@ -1574,5 +1587,34 @@ fn invalid_watch_owners_cannot_hide_valid_notes() -> anyhow::Result<()> {
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
     assert!(tracker.watch(pix_id(3), invalid, fixture.scan_secret, ten()).is_err());
     assert!(tracker.watched_allocations().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_pending_snapshot_reaches_committed_notes() -> anyhow::Result<()> {
+    for total in [1000, 1001] {
+        let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+        let fixture = owned_candidate(2)?;
+        let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+        let receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret, ten())?;
+        let index = ScriptedIndex {
+            snapshot_pending: true,
+            ..Default::default()
+        };
+        let mut unrelated = owned_candidate(1)?.note;
+        unrelated.view_tag = -1;
+        index.pending.lock().extend(std::iter::repeat_n(unrelated, total - 1));
+        index.pending.lock().push(fixture.note);
+        index.committed.lock().push(completion(&fixture.note_id, 3));
+        *index.head.lock() = (5, 1);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            super::lifecycle::catch_up(&index, &tracker, true),
+        )
+        .await?
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), receiver).await??, ten());
+        assert_eq!(state.committed_amount(&fixture.id)?, ten());
+    }
     Ok(())
 }

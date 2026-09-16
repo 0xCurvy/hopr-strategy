@@ -347,6 +347,20 @@ impl RedbCurvyDepositState {
         Ok(Self { db: Arc::new(db) })
     }
 
+    #[cfg(test)]
+    pub(super) fn in_memory() -> Result<Self, CurvyStateError> {
+        let db = redb::Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .map_err(state_db_error)?;
+        let write = db.begin_write().map_err(state_db_error)?;
+        write.open_table(CURSOR_TABLE).map_err(state_db_error)?;
+        write.open_table(OWNED_NOTES_TABLE).map_err(state_db_error)?;
+        write.open_table(NOTE_SESSIONS_TABLE).map_err(state_db_error)?;
+        write.open_table(SCAN_SECRETS_TABLE).map_err(state_db_error)?;
+        write.commit().map_err(state_db_error)?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
     /// The database, shared with the SDK bridge so its state lives in the same file and is wiped
     /// together with this one.
     pub(super) fn shared_database(&self) -> Arc<redb::Database> {
