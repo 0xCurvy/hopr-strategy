@@ -495,6 +495,9 @@ fn deposit_data_round_trips_through_the_wire_form() -> anyhow::Result<()> {
 /// A note index the test writes to directly, standing in for Blokli.
 #[derive(Default)]
 struct ScriptedIndex {
+    fail_pending: std::sync::atomic::AtomicBool,
+    pending_calls: std::sync::atomic::AtomicUsize,
+    snapshot_pending: bool,
     pending: parking_lot::Mutex<Vec<CurvyPendingNote>>,
     /// Committed notes served as candidates, for a source whose pending view missed them.
     committed_candidates: parking_lot::Mutex<Vec<CurvyPendingNote>>,
@@ -530,16 +533,28 @@ impl CurvyIndexSource for ScriptedIndex {
         &self,
         after: Option<CurvyEventCursor>,
         first: u32,
-    ) -> Result<Vec<CurvyPendingNote>, String> {
+    ) -> Result<super::PendingNotesPage, String> {
+        self.pending_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_pending.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("endpoint unavailable".to_owned());
+        }
+        if self.snapshot_pending {
+            return Ok(super::PendingNotesPage {
+                notes: self.pending.lock().clone(),
+                has_more: false,
+            });
+        }
         let after = after.as_ref().map(cursor_ordinal);
-        Ok(self
-            .pending
-            .lock()
-            .iter()
-            .filter(|note| after.is_none_or(|after| ordinal(&note.position) > after))
-            .take(first as usize)
-            .cloned()
-            .collect())
+        Ok(super::PendingNotesPage::paged(
+            self.pending
+                .lock()
+                .iter()
+                .filter(|note| after.is_none_or(|after| ordinal(&note.position) > after))
+                .take(first as usize)
+                .cloned()
+                .collect(),
+            first,
+        ))
     }
 
     async fn committed_notes(
@@ -573,6 +588,7 @@ impl CurvyIndexSource for ScriptedIndex {
             .cloned()
             .collect())
     }
+
     async fn indexed_head(&self) -> Result<(u64, u64), String> {
         Ok(*self.head.lock())
     }
@@ -594,6 +610,7 @@ impl CurvyIndexSource for ScriptedIndex {
 #[derive(Default)]
 struct RecordingAdapter {
     funded: parking_lot::Mutex<Vec<(HoprBalance, Address)>>,
+    funding_finality_failures: parking_lot::Mutex<usize>,
     /// How many upcoming `allocate` calls answer "not in the committed tree yet".
     tree_lag_failures: parking_lot::Mutex<usize>,
     /// Every `allocate` call, successful or not.
@@ -635,6 +652,13 @@ impl CurvySdkAdapter for RecordingAdapter {
 
     async fn ensure_funded(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error> {
         self.funded.lock().push((gross, recovery_address));
+        let mut waiting = self.funding_finality_failures.lock();
+        if *waiting > 0 {
+            *waiting -= 1;
+            return Err(ScriptedFailure(
+                super::sdk::RsSdkCurvyAdapterError::RelayFinalityPending.to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -956,7 +980,7 @@ async fn a_batch_is_one_allocation_call() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn state_from_another_chain_is_discarded_on_first_use() -> anyhow::Result<()> {
+async fn missing_notes_preserve_state_and_reconciliation_can_retry() -> anyhow::Result<()> {
     let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
     let pool = &harness.pool;
     let fixture = owned_candidate(1)?;
@@ -970,19 +994,21 @@ async fn state_from_another_chain_is_discarded_on_first_use() -> anyhow::Result<
     pool.state()
         .record_owned_candidate(&fixture.note_id, detected, &CurvyEventCursor::from(&position(1)))?;
     pool.state().store_scan_secret(&fixture.id, &fixture.scan_secret)?;
-    // The endpoint has never heard of that note.
+    // An incomplete/rebuilt index is not evidence of another chain.
     *harness.index.known_notes.lock() = Some(HashSet::new());
     *harness.index.head.lock() = (10, 1);
+    let first_id = pix_id(9);
+    assert!(pool.generate_deposit_data(&first_id).await.is_err());
+    assert_eq!(pool.state().owned_note_ids()?, vec![fixture.note_id.clone()]);
+    assert!(pool.state().scan_secret(&fixture.id)?.is_some());
+    assert_eq!(*harness.adapter.resets.lock(), 0);
 
-    pool.generate_deposit_data(&pix_id(9)).await?;
-
-    assert!(pool.state().owned_note_ids()?.is_empty());
-    assert!(pool.state().scan_secret(&fixture.id)?.is_none());
-    assert_eq!(*harness.adapter.resets.lock(), 1);
-    // Once per process: the fresh data written above survives the next call.
+    *harness.index.known_notes.lock() = Some(HashSet::from([fixture.note_id]));
+    pool.generate_deposit_data(&first_id).await?;
     pool.generate_deposit_data(&pix_id(10)).await?;
-    assert!(pool.state().scan_secret(&pix_id(9)).is_ok());
-    assert_eq!(*harness.adapter.resets.lock(), 1);
+    assert!(pool.state().scan_secret(&first_id)?.is_some());
+    assert!(pool.state().scan_secret(&fixture.id)?.is_some());
+    assert_eq!(*harness.adapter.resets.lock(), 0);
     Ok(())
 }
 
@@ -1003,7 +1029,8 @@ async fn state_from_the_same_chain_is_kept() -> anyhow::Result<()> {
     *harness.index.known_notes.lock() = Some(HashSet::from([fixture.note_id.clone()]));
     *harness.index.head.lock() = (10, 1);
 
-    pool.generate_deposit_data(&pix_id(9)).await?;
+    let first_id = pix_id(9);
+    pool.generate_deposit_data(&first_id).await?;
 
     assert_eq!(pool.state().owned_note_ids()?, vec![fixture.note_id]);
     assert_eq!(*harness.adapter.resets.lock(), 0);
@@ -1033,6 +1060,21 @@ async fn pool_transfer_is_not_supported() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 // Mode configuration
 // ---------------------------------------------------------------------------
+
+#[test_log::test(tokio::test)]
+async fn a_deposit_waits_for_finality_before_funding() -> anyhow::Result<()> {
+    let adapter = RecordingAdapter::consistent();
+    *adapter.funding_finality_failures.lock() = 2;
+    let harness = harness(adapter, Duration::from_secs(2)).await?;
+    let id = pix_id(1);
+    let owner = BjjKeypair::random();
+    let data = harness.pool.generate_deposit_data(&id).await?;
+    harness.pool.deposit_funds_to(&id, owner.public(), ten(), data).await?;
+    assert_eq!(harness.adapter.funded.lock().len(), 3);
+    assert_eq!(*harness.adapter.allocate_attempts.lock(), 1);
+    assert_eq!(harness.adapter.allocations.lock().len(), 1);
+    Ok(())
+}
 
 #[test_log::test(tokio::test)]
 async fn a_deposit_waits_for_the_committed_tree_instead_of_failing() -> anyhow::Result<()> {
@@ -1131,6 +1173,20 @@ async fn a_tree_that_never_catches_up_fails_within_the_tracking_budget() -> anyh
 
 #[test]
 fn tree_lag_is_recognised_and_polled_at_a_tenth_of_the_budget() {
+    use super::{relayer::RelayError, sdk::RsSdkCurvyAdapterError};
+
+    assert!(super::is_retryable_lag(
+        &RsSdkCurvyAdapterError::RelayFinalityPending.to_string()
+    ));
+    assert!(super::is_retryable_lag(
+        &RelayError::RateLimited("429".into()).to_string()
+    ));
+    assert!(!super::is_retryable_lag(
+        &RelayError::AccessDenied("401".into()).to_string()
+    ));
+    assert!(!super::is_retryable_lag(
+        &RsSdkCurvyAdapterError::RelayFinalityUnavailable("no checkpoint".into()).to_string()
+    ));
     assert!(super::is_tree_lag(TREE_LAG));
     assert!(super::is_tree_lag(
         "sync: index did not reconcile after retries: 1 indexed leaves ..."
@@ -1138,8 +1194,8 @@ fn tree_lag_is_recognised_and_polled_at_a_tenth_of_the_budget() {
     assert!(!super::is_tree_lag("no committed note large enough"));
     // A rate-limited or failed RPC read behind Blokli is waited out the same way.
     assert!(super::is_retryable_lag(
-        "Curvy SDK operation failed: submission rejected: curvyVaultFees failed: RPC_ERROR RPC error \
-         during query Curvy Vault fees: Max retries exceeded HTTP error 429 with body: 429 Too Many Requests"
+        "Curvy SDK operation failed: submission rejected: curvyVaultFees failed: RPC_ERROR RPC error during query \
+         Curvy Vault fees: Max retries exceeded HTTP error 429 with body: 429 Too Many Requests"
     ));
     assert!(super::is_retryable_lag(
         "Curvy SDK operation failed: transport: reading the Curvy indexer's response to /sync/notes?chainId=100: \
@@ -1389,7 +1445,11 @@ async fn replay_detection_against_staging() -> anyhow::Result<()> {
             Err(error) => println!("  leaf {}: ERROR {error}", candidate.position.event_item_index.0),
         }
     }
-    let pending = source.pending_notes(None, 1000).await.map_err(anyhow::Error::msg)?;
+    let pending = source
+        .pending_notes(None, 1000)
+        .await
+        .map_err(anyhow::Error::msg)?
+        .notes;
     println!("{} pending", pending.len());
     for candidate in &pending {
         if let Ok(Some(note)) = detector.detect_owned_note(candidate, &watched) {
@@ -1456,7 +1516,7 @@ async fn staging_indexer_serves_gnosis_notes() -> anyhow::Result<()> {
     let (head, finality) = source.indexed_head().await.map_err(anyhow::Error::msg)?;
     println!("gnosis finalized head {head}, finality {finality}");
     assert!(head > 48_060_257, "past the aggregator's deployment block");
-    let pending = source.pending_notes(None, 10).await.map_err(anyhow::Error::msg)?;
+    let pending = source.pending_notes(None, 10).await.map_err(anyhow::Error::msg)?.notes;
     let committed = source.committed_notes(None, 10).await.map_err(anyhow::Error::msg)?;
     println!("pending {} committed {}", pending.len(), committed.len());
     let candidates = source
@@ -1509,5 +1569,132 @@ fn modes_round_trip_as_lowercase() -> anyhow::Result<()> {
     assert!(encoded.contains(r#""shielding":"portal""#), "{encoded}");
     assert!(encoded.contains(r#""submission":"operator""#), "{encoded}");
     assert_eq!(serde_json::from_str::<CurvyDepositPoolConfig>(&encoded)?, cfg);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_index_behind_the_saved_cursor_preserves_recovery_state() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    let pool = &harness.pool;
+    let id = pix_id(1);
+    let secret = scan_secret("03", "04")?;
+    pool.state().store_scan_secret(&id, &secret)?;
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        pool.state()
+            .advance_cursor(kind, &CurvyEventCursor::from(&position(100)))?;
+    }
+    *harness.index.head.lock() = (99, 1);
+    assert!(pool.generate_deposit_data(&id).await.is_err());
+    assert_eq!(pool.state().scan_secret(&id)?.unwrap().public(), secret.public());
+    assert_eq!(*harness.adapter.resets.lock(), 0);
+    *harness.index.head.lock() = (100, 1);
+    assert_eq!(*pool.generate_deposit_data(&id).await?.scan_key(), secret.public());
+    Ok(())
+}
+
+#[tokio::test]
+async fn unconfirmed_sdk_funding_never_resets_the_pool() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    let id = pix_id(1);
+    let secret = scan_secret("03", "04")?;
+    harness.pool.state().store_scan_secret(&id, &secret)?;
+    *harness.adapter.consistent.lock() = false;
+    assert!(harness.pool.generate_deposit_data(&id).await.is_err());
+    assert!(harness.pool.state().scan_secret(&id)?.is_some());
+    assert_eq!(*harness.adapter.resets.lock(), 0);
+    *harness.adapter.consistent.lock() = true;
+    harness.pool.generate_deposit_data(&id).await?;
+    Ok(())
+}
+
+#[test]
+fn invalid_watch_owners_cannot_hide_valid_notes() -> anyhow::Result<()> {
+    // Serde accepts these bytes even though the checked point conversion rejects them.
+    let invalid: BjjPublicKey = serde_json::from_value(serde_json::json!(vec![255u8; 32]))?;
+    assert!(super::detect::bjj_point(&invalid).is_err());
+    let fixture = owned_candidate(1)?;
+    let detected = fixture
+        .detector
+        .detect_owned_note(
+            &fixture.note,
+            &[
+                (pix_id(2), invalid, fixture.scan_secret.clone()),
+                (fixture.id, fixture.address, fixture.scan_secret.clone()),
+            ],
+        )?
+        .expect("invalid local owner must not quarantine the valid public event");
+    assert_eq!(detected.deposit.id, fixture.id);
+
+    let dir = tempfile::tempdir()?;
+    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("state.redb"))?);
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
+    assert!(tracker.watch(pix_id(3), invalid, fixture.scan_secret, ten()).is_err());
+    assert!(tracker.watched_allocations().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_pending_snapshot_reaches_committed_notes() -> anyhow::Result<()> {
+    for total in [1000, 1001] {
+        let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+        let fixture = owned_candidate(2)?;
+        let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+        let receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret, ten())?;
+        let index = ScriptedIndex {
+            snapshot_pending: true,
+            ..Default::default()
+        };
+        let mut unrelated = owned_candidate(1)?.note;
+        unrelated.view_tag = -1;
+        index.pending.lock().extend(std::iter::repeat_n(unrelated, total - 1));
+        index.pending.lock().push(fixture.note);
+        index.committed.lock().push(completion(&fixture.note_id, 3));
+        *index.head.lock() = (5, 1);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            super::lifecycle::catch_up(&index, &tracker, true),
+        )
+        .await?
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), receiver).await??, ten());
+        assert_eq!(state.committed_amount(&fixture.id)?, ten());
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn watcher_failures_back_off_and_success_resets_polling() -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(1)?;
+    let tracker = Arc::new(CurvyLifecycleTracker::new(Arc::new(fixture.detector), state));
+    let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret, ten())?;
+    let index = Arc::new(ScriptedIndex::default());
+    index.fail_pending.store(true, Ordering::SeqCst);
+    let worker = tokio::spawn(super::lifecycle::run_watcher(
+        index.clone(),
+        tracker.clone(),
+        Duration::from_secs(10),
+    ));
+    tokio::task::yield_now().await;
+    assert_eq!(index.pending_calls.load(Ordering::SeqCst), 1);
+    for (delay, count) in [(250, 2), (500, 3), (1000, 4), (1000, 5)] {
+        tokio::time::advance(Duration::from_millis(delay - 1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(index.pending_calls.load(Ordering::SeqCst), count - 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(index.pending_calls.load(Ordering::SeqCst), count);
+        assert!(tracker.replay_history.load(Ordering::SeqCst));
+    }
+    index.fail_pending.store(false, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(index.pending_calls.load(Ordering::SeqCst), 6);
+    assert!(!tracker.replay_history.load(Ordering::SeqCst));
+    tokio::time::advance(Duration::from_millis(250)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(index.pending_calls.load(Ordering::SeqCst), 7);
+    worker.abort();
     Ok(())
 }

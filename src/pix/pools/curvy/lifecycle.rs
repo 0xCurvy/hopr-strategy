@@ -41,17 +41,33 @@ use hopr_api::{
 };
 
 use super::{
-    detect::{CurvyDetectionError, RsCoreCurvyNoteDetector},
+    detect::{CurvyDetectionError, RsCoreCurvyNoteDetector, bjj_point},
     state::{CurvyDepositState, CurvyEventKind, CurvyStateError, cursor_component, note_id_key},
 };
 
 const QUERY_PAGE_SIZE: u32 = 1_000;
-/// Pause between two passes over the index, and after a failed one.
+/// Normal polling interval between successful passes over the index.
 ///
 /// Short, because it sits directly on the confirmation latency: a commitment becomes final one
 /// block after it lands, and every pass that starts just before that block wastes a whole
 /// interval. Blokli answers these pages locally, so the cost of asking often is small.
 const RECONNECT_DELAY: Duration = Duration::from_millis(250);
+
+/// A pending-note traversal step. Snapshot sources return their entire pinned snapshot
+/// with `has_more = false`; event streams can continue from the last note's cursor.
+pub struct PendingNotesPage {
+    pub notes: Vec<CurvyPendingNote>,
+    pub has_more: bool,
+}
+
+impl PendingNotesPage {
+    pub fn paged(notes: Vec<CurvyPendingNote>, first: u32) -> Self {
+        Self {
+            has_more: notes.len() == first as usize,
+            notes,
+        }
+    }
+}
 
 /// The slice of Blokli's Curvy API that discovery reads through.
 ///
@@ -59,9 +75,8 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(250);
 /// it is implemented for any [`BlokliQueryClient`] by [`BlokliIndex`].
 #[async_trait]
 pub trait CurvyIndexSource: Send + Sync + 'static {
-    /// One page of pending notes strictly after `after`, oldest first.
-    async fn pending_notes(&self, after: Option<CurvyEventCursor>, first: u32)
-    -> Result<Vec<CurvyPendingNote>, String>;
+    /// Pending events after `after`, or one complete pinned snapshot for snapshot sources.
+    async fn pending_notes(&self, after: Option<CurvyEventCursor>, first: u32) -> Result<PendingNotesPage, String>;
 
     /// One page of committed notes strictly after `after`, oldest first.
     async fn committed_notes(
@@ -78,8 +93,7 @@ pub trait CurvyIndexSource: Send + Sync + 'static {
     async fn nullifier_spent(&self, nullifier: String) -> Result<bool, String>;
 
     /// Whether the aggregator knows `note_id` (a `0x`-prefixed 32-byte hex string) at all —
-    /// pending or committed. A chain that has never seen a note this node recorded is not the
-    /// chain the record came from.
+    /// pending or committed. An unknown note can also mean the index is still catching up.
     async fn note_known(&self, note_id: String) -> Result<bool, String>;
 
     /// Committed notes strictly after `after`, carrying what the detector scans, for sources
@@ -103,15 +117,11 @@ impl<C> CurvyIndexSource for BlokliIndex<C>
 where
     C: BlokliQueryClient + Send + Sync + 'static,
 {
-    async fn pending_notes(
-        &self,
-        after: Option<CurvyEventCursor>,
-        first: u32,
-    ) -> Result<Vec<CurvyPendingNote>, String> {
+    async fn pending_notes(&self, after: Option<CurvyEventCursor>, first: u32) -> Result<PendingNotesPage, String> {
         self.0
             .query_curvy_pending_notes(None, after, first)
             .await
-            .map(|page| page.notes)
+            .map(|page| PendingNotesPage::paged(page.notes, first))
             .map_err(|error| error.to_string())
     }
 
@@ -213,6 +223,7 @@ where
         scan_secret: CurvyScanSecret,
         minimum: HoprBalance,
     ) -> Result<futures::channel::oneshot::Receiver<HoprBalance>, CurvyStateError> {
+        bjj_point(&address).map_err(|error| CurvyStateError::Corrupt(format!("invalid watch owner: {error}")))?;
         let (sender, receiver) = futures::channel::oneshot::channel();
         // Serialize the persisted-state check with completion notifications. This
         // prevents a completion from landing between the check and waiter insert.
@@ -391,7 +402,11 @@ where
 }
 
 /// One catch-up pass over both event families. See the module docs for the ordering.
-async fn catch_up<I, S>(client: &I, tracker: &CurvyLifecycleTracker<S>, replay_history: bool) -> Result<(), String>
+pub(super) async fn catch_up<I, S>(
+    client: &I,
+    tracker: &CurvyLifecycleTracker<S>,
+    replay_history: bool,
+) -> Result<(), String>
 where
     I: CurvyIndexSource,
     S: CurvyDepositState,
@@ -401,8 +416,8 @@ where
         .map_err(|error| error.to_string())?;
     loop {
         let page = client.pending_notes(pending_after.clone(), QUERY_PAGE_SIZE).await?;
-        let page_len = page.len();
-        for note in page {
+        let has_more = page.has_more;
+        for note in page.notes {
             pending_after = Some(CurvyEventCursor::from(&note.position));
             if !tracker
                 .process_candidate(note)
@@ -412,7 +427,7 @@ where
                 return Ok(());
             }
         }
-        if page_len < QUERY_PAGE_SIZE as usize {
+        if !has_more {
             break;
         }
     }
@@ -470,26 +485,36 @@ where
 ///
 /// Runs until aborted. Captures only the client and the tracker — never the pool — so that
 /// dropping the pool is what ends it (see `CurvyDepositPool`'s `Drop`).
-pub(super) async fn run_watcher<I, S>(client: Arc<I>, tracker: Arc<CurvyLifecycleTracker<S>>)
+pub(super) async fn run_watcher<I, S>(client: Arc<I>, tracker: Arc<CurvyLifecycleTracker<S>>, tracking_budget: Duration)
 where
     I: CurvyIndexSource,
     S: CurvyDepositState,
 {
+    // Keep several retry opportunities within even a short deposit tracking budget.
+    let cap = (tracking_budget / 10).clamp(RECONNECT_DELAY, Duration::from_secs(5));
+    let mut retry_delay = RECONNECT_DELAY;
     loop {
         if tracker.watched_allocations().is_empty() {
+            retry_delay = RECONNECT_DELAY;
             tokio::time::sleep(RECONNECT_DELAY).await;
             continue;
         }
 
         let replay_history = tracker.replay_history.swap(false, Ordering::AcqRel);
-        if let Err(error) = catch_up(client.as_ref(), tracker.as_ref(), replay_history).await {
-            tracker.restore_failed_replay(replay_history);
-            tracing::warn!(
-                %error,
-                replay_history,
-                "failed to catch up Curvy PIX notes; retrying without losing historical replay"
-            );
-        }
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        let delay = match catch_up(client.as_ref(), tracker.as_ref(), replay_history).await {
+            Ok(()) => {
+                retry_delay = RECONNECT_DELAY;
+                RECONNECT_DELAY
+            }
+            Err(error) => {
+                tracker.restore_failed_replay(replay_history);
+                let delay = retry_delay;
+                retry_delay = retry_delay.saturating_mul(2).min(cap);
+                tracing::warn!(%error, replay_history, retry_in = ?delay,
+                    "failed to catch up Curvy PIX notes; retrying without losing historical replay");
+                delay
+            }
+        };
+        tokio::time::sleep(delay).await;
     }
 }

@@ -9,11 +9,14 @@
 //!
 //! The PIX deposit address stays what the SSA protocol makes it: the Baby JubJub public key whose
 //! private key the Exit reconstructs from shares. That key is the note's **owner** and the only
-//! spending authority. What Curvy adds is *discovery*: the Exit cannot scan the whole pool with a
-//! key it does not have yet, so for every SSA it mints a throwaway **scan identity** `(K, V)` — a
-//! stealth meta-key pair whose spend scalar is discarded on the spot. The public half travels to
-//! the Entry as the allocation's deposit data; the view scalar `v` stays at the Exit, persisted
-//! keyed by the allocation, and is what later recognises the note among everyone else's.
+//! spending authority. Curvy adds a separate **scan identity** `(K, V)` for discovering and
+//! decrypting the allocation before the Exit has reconstructed the SSA private key. The Entry
+//! explicitly assigns the note to the SSA owner, independently of these scan keys. Keeping all
+//! the scan key material would still not let the Exit spend the note without the SSA private key.
+//!
+//! The public scan identity travels to the Entry as deposit data. The Exit persists the view
+//! scalar `v` and public `K` for discovery; the unused scalar `k` is discarded as key hygiene,
+//! not as a condition of the protocol's security.
 //!
 //! | event | who | what this pool does |
 //! |---|---|---|
@@ -72,9 +75,9 @@
 //!   in production, `https://api.curvy.dev` for staging. No default: pointing a misconfigured node at a production
 //!   relayer is worse than refusing to start.
 //! * The **Curvy operator key**, from the environment variable named by [`CurvyDepositPoolConfig::operator_key_env`] —
-//!   **only under `submission: operator`**, where it signs and pays for allocations, withdrawals and note commitments.
-//!   A relayed node needs no EVM key of its own: the relayer submits, the batch-prover commits, and the shield is
-//!   signed by the node's existing chain key.
+//!   **under `submission: operator` or `shielding: portal`**: portal deployment is always self-signed. A relayed node
+//!   using direct shielding needs no additional EVM key: the relayer submits, the batch-prover commits, and the shield
+//!   is signed by the node's existing chain key.
 //! * The Curvy **proving artifacts**: every allocation, commitment and withdrawal is a Groth16 proof made in-process,
 //!   and the SDK loads each circuit's zkey and witness graph from `CURVY_ZK_KEYS_DIR` (flat, one zkey and one
 //!   `*.signet.zst` graph per circuit, digest-checked; a `CURVY_*_ZKEY` / `CURVY_*_GRAPH` pair per circuit overrides
@@ -88,14 +91,13 @@
 //!   identity, the funding notes, every discovered note and the scan secrets. Losing it loses the ability to sweep what
 //!   has not been swept yet.
 //!
-//! ### Restarts and stale state
+//! ### Restarts and synchronization
 //!
-//! The state file describes one particular chain. Against a re-created development chain — the
-//! localcluster does exactly that on every run — the same file would make the Entry believe it is
-//! funded and the Exit skip events it has not seen. So the first operation after a start checks
-//! the state against the endpoint: a cursor past the indexer's head, or a note the aggregator has
-//! never heard of, means a different chain, and everything chain-specific is discarded (the
-//! node's Curvy identity is kept).
+//! A saved cursor ahead of the index or a temporarily unknown note can mean the endpoint is
+//! rebuilding its index. Reconciliation then fails without deleting any recovery state and is
+//! retried on the next operation. Missing notes are never proof of a different deployment.
+//! For a deliberately re-created development chain, select a fresh `state_path`; keep the old
+//! database available for recovering funds on its original deployment.
 //!
 //! Enabled by `strategy-pix-curvy`, to be paired with `hopr-lib/pix-bjj` (the default) so that
 //! `HoprPixSpec` produces the `BjjPublicKey` deposit addresses this pool settles to. Built through
@@ -130,7 +132,7 @@ use hopr_api::{
         primitive::prelude::{Address, HoprBalance, IntoEndian, U256},
     },
 };
-pub use lifecycle::{BlokliIndex, CurvyIndexSource};
+pub use lifecycle::{BlokliIndex, CurvyIndexSource, PendingNotesPage};
 pub use sdk::{
     CurvyChainEndpoints, CurvySdkAdapter, DirectShielder, PortalFunder, RsSdkCurvyAdapter, RsSdkCurvyAdapterConfig,
     RsSdkCurvyAdapterError,
@@ -632,6 +634,11 @@ pub enum CurvyDepositPoolError {
     },
     #[error("Curvy deposit watcher stopped before the deposit was committed")]
     WatcherStopped,
+    #[error(
+        "Curvy recovery state is not yet confirmed by the endpoint; retry after synchronization, or use a fresh \
+         state_path for a new deployment"
+    )]
+    ReconciliationPending,
     #[error("Curvy indexer query failed: {0}")]
     Indexer(String),
     #[error("timed out waiting for a Curvy deposit to be committed")]
@@ -736,7 +743,7 @@ impl CurvyIndexSource for NoteIndex {
         &self,
         after: Option<blokli_client::api::types::CurvyEventCursor>,
         first: u32,
-    ) -> Result<Vec<blokli_client::api::types::CurvyPendingNote>, String> {
+    ) -> Result<PendingNotesPage, String> {
         match self {
             Self::Blokli(index) => index.pending_notes(after, first).await,
             Self::CurvyIndexer(index) => index.pending_notes(after, first).await,
@@ -848,17 +855,17 @@ where
         // After the overrides, so an env-selected mode is judged rather than the file's default.
         validate_mode_requirements(&cfg)?;
 
-        // The operator key signs proofs only when this node submits them itself. A relayed node
-        // needs no EVM key of its own: the relayer submits aggregations and withdrawals, the
-        // deployment's batch-prover commits, and the shield is paid by the Safe.
-        let operator_key = match cfg.submission {
-            CurvySubmission::Operator => std::env::var(&cfg.operator_key_env).map_err(|_| {
+        // Portal deployment is self-signed even when proofs go through the relayer.
+        let operator_key = if cfg.submission == CurvySubmission::Operator || cfg.shielding == CurvyShielding::Portal {
+            std::env::var(&cfg.operator_key_env).map_err(|_| {
                 StrategyError::InvalidConfiguration(format!(
-                    "environment variable {} must hold the Curvy operator's private key when submission is `operator`",
+                    "environment variable {} must hold a valid Curvy signing key for operator submission or portal \
+                     shielding",
                     cfg.operator_key_env
                 ))
-            })?,
-            CurvySubmission::Relayer => String::new(),
+            })?
+        } else {
+            String::new()
         };
         let initial_funding = match std::env::var(INITIAL_FUNDING_ENV) {
             Ok(raw) => HoprBalance::from_str(&raw).map_err(|error| {
@@ -983,19 +990,13 @@ where
         &self.tracker.state
     }
 
-    /// Runs the stale-state check once per process. See the module docs.
+    /// Complete reconciliation once the endpoint can account for our durable state.
+    /// A failed check leaves the cell uninitialized, so the next operation retries it.
     async fn ensure_reconciled(&self) -> Result<(), CurvyDepositPoolError> {
         self.reconciled
             .get_or_try_init(|| async {
-                if self.state_is_stale().await? {
-                    tracing::warn!(
-                        "the Curvy PIX state describes a chain other than the one behind the endpoint; discarding it \
-                         and starting over"
-                    );
-                    self.tracker.state.wipe_chain_state()?;
-                    self.adapter
-                        .reset_chain_state()
-                        .map_err(|error| CurvyDepositPoolError::Adapter(error.into()))?;
+                if self.state_needs_sync().await? {
+                    return Err(CurvyDepositPoolError::ReconciliationPending);
                 }
                 Ok(())
             })
@@ -1003,7 +1004,7 @@ where
             .map(|_| ())
     }
 
-    async fn state_is_stale(&self) -> Result<bool, CurvyDepositPoolError> {
+    async fn state_needs_sync(&self) -> Result<bool, CurvyDepositPoolError> {
         let (head, _) = self
             .index
             .indexed_head()
@@ -1038,12 +1039,12 @@ where
             .map_err(|error| CurvyDepositPoolError::Adapter(error.into()))
     }
 
-    /// A fresh scan identity: `(K, V)` from Curvy's stealth key generation, with the spend scalar
-    /// `k` discarded immediately. The Exit keeps `v` and `K`; the Entry gets `K` and `V`.
+    /// A fresh discovery identity. The Exit keeps `v` and `K`; the Entry gets `K` and `V`.
+    /// The unused scalar `k` is unrelated to the SSA private key that authorizes spending.
     fn generate_scan_secret() -> Result<CurvyScanSecret, CurvyDepositPoolError> {
         let (k, v, big_k, big_v) =
             stealth::new_meta().map_err(|error| CurvyDepositPoolError::ScanIdentity(error.to_string()))?;
-        // Never a spending key of anything: dropped as soon as it exists.
+        // PIX does not use this scalar. Retaining it would not authorize spending an SSA-owned note.
         drop(Zeroizing::new(k));
         let v = Zeroizing::new(v);
         let v_bytes = Zeroizing::new(
@@ -1149,7 +1150,11 @@ where
         // is what ends the task (see `Drop`) rather than the task keeping the pool alive.
         let index = Arc::clone(&self.index);
         let tracker = Arc::clone(&self.tracker);
-        *watcher = Some(tokio::spawn(lifecycle::run_watcher(index, tracker)));
+        *watcher = Some(tokio::spawn(lifecycle::run_watcher(
+            index,
+            tracker,
+            self.cfg.max_deposit_tracking_time,
+        )));
     }
 
     async fn allocate(
@@ -1158,10 +1163,6 @@ where
     ) -> Result<(), StrategyError> {
         self.ensure_reconciled().await?;
         let safe_address = self.node.identity().safe_address;
-        self.adapter
-            .ensure_funded(self.initial_funding, safe_address)
-            .await
-            .map_err(|error| StrategyError::other(CurvyDepositPoolError::Adapter(error.into())))?;
         // The funding note has to be *committed* before it can be spent, and committed by
         // whoever commits on this deployment: under `submission: relayer` that is the shared
         // batch-prover, on its own schedule, and the SDK's tree — read from a finalized
@@ -1172,8 +1173,19 @@ where
         let deadline = tokio::time::Instant::now() + self.cfg.max_deposit_tracking_time;
         let poll = tree_lag_poll_interval(self.cfg.max_deposit_tracking_time);
         let mut waited = 0u32;
+        let mut funded = false;
         loop {
-            match self.adapter.allocate(deposits.clone()).await {
+            let result = async {
+                // Reconciliation can await finality before funding as well as before allocation.
+                // Retry here so the adapter's chain lock is released during the delay.
+                if !funded {
+                    self.adapter.ensure_funded(self.initial_funding, safe_address).await?;
+                    funded = true;
+                }
+                self.adapter.allocate(deposits.clone()).await
+            }
+            .await;
+            match result {
                 Ok(()) => {
                     if waited > 0 {
                         tracing::info!(
@@ -1215,7 +1227,9 @@ where
 /// disagreed while a commitment was still settling — rather than a fault. Matched on text because
 /// the SDK reports both as opaque `anyhow` messages.
 fn is_tree_lag(message: &str) -> bool {
-    message.contains("not found in committed tree") || message.contains("index did not reconcile")
+    message.contains("not found in committed tree")
+        || message.contains("index did not reconcile")
+        || message.contains("waiting for the winning Curvy aggregation outputs to become finalized")
 }
 
 /// A chain read that failed on the way to the RPC rather than in the protocol: a rate limit or a
@@ -1226,6 +1240,7 @@ fn is_transient_chain_read(message: &str) -> bool {
         || message.contains("Max retries exceeded")
         || message.contains("HTTP error 429")
         || message.contains("HTTP error 5")
+        || message.contains("the Curvy relayer rate limited the request:")
         // The gate re-priced gas between the quote and the proof; the next attempt re-quotes.
         || message.contains("operator note does not cover the gas cost")
         // A truncated or reset response from the gateway or the indexer, on the way to a read.

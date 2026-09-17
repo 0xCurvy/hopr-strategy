@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use blokli_client::exports::Url;
 use hopr_api::types::primitive::prelude::U256;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::errors::StrategyError;
 
@@ -39,7 +39,7 @@ use crate::errors::StrategyError;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// What a submission is doing, as the relayer reports it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RelayStatus {
     Queued,
@@ -339,6 +339,13 @@ impl ProtocolEnvelope {
 /// Errors the relayer reports that a caller must distinguish.
 #[derive(Debug, thiserror::Error)]
 pub enum RelayError {
+    /// A previously assigned request id is no longer tracked; its proof may still land.
+    #[error("the Curvy relayer no longer knows request {0}")]
+    MissingRequest(String),
+    #[error("the Curvy relayer denied access: {0}")]
+    AccessDenied(String),
+    #[error("the Curvy relayer rate limited the request: {0}")]
+    RateLimited(String),
     /// The relayer refused the submission outright — a fee note it will not accept, or a payload
     /// it cannot read. Re-submitting the same proof will fail the same way.
     #[error("the Curvy relayer rejected the submission: {0}")]
@@ -351,7 +358,20 @@ pub enum RelayError {
     Failed(String),
     /// Nothing terminal happened within the deadline. The submission may still land.
     #[error("timed out waiting for the Curvy relayer to submit {request_id}, last status {status:?}")]
-    Timeout { request_id: String, status: RelayStatus },
+    Timeout {
+        request_id: String,
+        status: RelayStatus,
+        transaction_hash: Option<String>,
+        progressed: bool,
+    },
+}
+
+impl RelayError {
+    /// These errors permit replacement of a journalled aggregation over the same inputs.
+    /// Neither one proves that an earlier copy of the proof cannot still land.
+    pub fn permits_replacement(&self) -> bool {
+        matches!(self, Self::MissingRequest(_) | Self::Rejected(_))
+    }
 }
 
 impl From<RelayError> for StrategyError {
@@ -466,7 +486,10 @@ impl RelayClient {
             .map_err(|error| RelayError::Transport(error.to_string()))?;
         if response.status() == reqwest::StatusCode::CONFLICT {
             // The relayer answers a conflict with the submission already holding the spend.
-            return Self::decode(response).await;
+            return response
+                .json::<RelaySubmission>()
+                .await
+                .map_err(|error| RelayError::Transport(format!("invalid relayer conflict response: {error}")));
         }
         Self::decode(response).await
     }
@@ -480,6 +503,9 @@ impl RelayClient {
             .send()
             .await
             .map_err(|error| RelayError::Transport(error.to_string()))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RelayError::MissingRequest(request_id.to_owned()));
+        }
         Self::decode(response).await
     }
 
@@ -487,7 +513,7 @@ impl RelayClient {
     ///
     /// The recovery path for a lost `POST` response: the intent id is ours and journalled before
     /// submitting, so this answers "did my proof reach the relayer" without knowing its
-    /// `requestId`. A `404` means it never arrived.
+    /// `requestId`. A `404` means it is not tracked, including requests the relayer forgot.
     pub async fn by_intent(&self, intent_id: &str, chain_id: u64) -> Result<Option<RelaySubmission>, RelayError> {
         let url = self.endpoint(&format!("/relay/intent/{intent_id}/status?networkId={chain_id}"))?;
         let response = self
@@ -513,9 +539,17 @@ impl RelayClient {
             return Self::terminal(current);
         }
         let started = std::time::Instant::now();
+        let mut progressed = false;
         while started.elapsed() < deadline {
             tokio::time::sleep(POLL_INTERVAL).await;
-            current = self.status(&current.request_id).await?;
+            let mut next = self.status(&current.request_id).await?;
+            progressed |= next.status != current.status
+                || next
+                    .transaction_hash
+                    .as_ref()
+                    .is_some_and(|hash| Some(hash) != current.transaction_hash.as_ref());
+            next.transaction_hash = next.transaction_hash.or(current.transaction_hash);
+            current = next;
             if current.status.is_terminal() {
                 return Self::terminal(current);
             }
@@ -523,6 +557,8 @@ impl RelayClient {
         Err(RelayError::Timeout {
             request_id: current.request_id,
             status: current.status,
+            transaction_hash: current.transaction_hash,
+            progressed,
         })
     }
 
@@ -540,14 +576,23 @@ impl RelayClient {
 
     /// Reads a response, separating the relayer's own refusals from transport faults.
     ///
-    /// The distinction decides whether a retry is worth anything: a `4xx` is a verdict on this
-    /// exact payload, while anything else may be transient.
+    /// Authentication and rate limits are not verdicts on the proof. Return them to the caller
+    /// without triggering proof replacement; transport faults likewise leave the proof intact.
     async fn decode<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T, RelayError> {
         let status = response.status();
         let body = response
             .text()
             .await
             .map_err(|error| RelayError::Transport(format!("reading the relayer's response: {error}")))?;
+        if matches!(status.as_u16(), 401 | 403) {
+            return Err(RelayError::AccessDenied(Self::describe(status, &body)));
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(RelayError::RateLimited(Self::describe(status, &body)));
+        }
+        if status == reqwest::StatusCode::REQUEST_TIMEOUT {
+            return Err(RelayError::Transport(Self::describe(status, &body)));
+        }
         if status.is_client_error() {
             return Err(RelayError::Rejected(Self::describe(status, &body)));
         }
@@ -811,5 +856,202 @@ mod tests {
         let described = RelayClient::describe(reqwest::StatusCode::BAD_GATEWAY, "<html>gateway</html>");
         assert!(described.contains("502"), "{described}");
         assert!(described.contains("gateway"), "{described}");
+    }
+}
+
+/// Local HTTP fixtures exercise the actual reqwest boundary without external services.
+#[cfg(test)]
+pub(super) mod http_tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    pub struct Server {
+        pub url: Url,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl Server {
+        pub async fn new(
+            handler: impl Fn(&str, serde_json::Value) -> Option<(u16, serde_json::Value)> + Send + 'static,
+        ) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
+            let task = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut input = Vec::new();
+                    let (head_end, length) = loop {
+                        let mut buffer = [0; 4096];
+                        let n = socket.read(&mut buffer).await.unwrap();
+                        if n == 0 {
+                            break (input.len(), 0);
+                        }
+                        input.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = input.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&input[..end]);
+                            let length = head
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap_or(0);
+                            break (end + 4, length);
+                        }
+                    };
+                    while input.len() < head_end + length {
+                        let mut buffer = [0; 4096];
+                        let n = socket.read(&mut buffer).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        input.extend_from_slice(&buffer[..n]);
+                    }
+                    let head = String::from_utf8_lossy(&input[..head_end]);
+                    let path = head.split_whitespace().nth(1).unwrap_or("");
+                    let body = serde_json::from_slice(&input[head_end..]).unwrap_or(serde_json::Value::Null);
+                    if let Some((status, response)) = handler(path, body) {
+                        let body = response.to_string();
+                        let response = format!(
+                            "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: \
+                             {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                    }
+                }
+            });
+            Self { url, task }
+        }
+    }
+
+    pub fn proof() -> curvy_abi::curvy_types::Groth16Proof {
+        serde_json::from_value(serde_json::json!({"a":["1","2"],"b":[["3","4"],["5","6"]],"c":["7","8"]})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn status_errors_separate_lost_requests_from_access_and_transient_failures() -> anyhow::Result<()> {
+        for code in [400, 401, 403, 404, 408, 410, 429, 503] {
+            let server = Server::new(move |_, _| Some((code, serde_json::json!({"error":"test"})))).await;
+            let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+            let error = client.status("saved-request").await.unwrap_err();
+            assert_eq!(error.permits_replacement(), matches!(code, 400 | 404 | 410));
+            match code {
+                401 | 403 => assert!(matches!(error, RelayError::AccessDenied(_))),
+                404 => {
+                    assert!(matches!(error, RelayError::MissingRequest(_)));
+                    assert!(client.by_intent("saved-intent", 100).await?.is_none());
+                }
+                429 => assert!(matches!(error, RelayError::RateLimited(_))),
+                408 | 503 => assert!(matches!(error, RelayError::Transport(_))),
+                _ => assert!(matches!(error, RelayError::Rejected(_))),
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inclusion_timeout_reports_progress_and_preserves_transaction_hash() -> anyhow::Result<()> {
+        let server = Server::new(|_, _| {
+            Some((
+                200,
+                serde_json::json!({
+                    "requestId":"saved", "status":"submitted"
+                }),
+            ))
+        })
+        .await;
+        let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+        let error = client
+            .await_inclusion(
+                RelaySubmission {
+                    request_id: "saved".into(),
+                    status: RelayStatus::Submitting,
+                    transaction_hash: Some("0xabc".into()),
+                    error: None,
+                },
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RelayError::Timeout {
+            status: RelayStatus::Submitted,
+            transaction_hash: Some(ref hash),
+            progressed: true,
+            ..
+        } if hash == "0xabc"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conflicts_resume_existing_submissions() -> anyhow::Result<()> {
+        for status in ["included", "queued"] {
+            let server = Server::new(move |path, _| {
+                Some(if path == "/relay/submit" {
+                    (409, serde_json::json!({"requestId":"existing","status":status}))
+                } else {
+                    assert_eq!(path, "/relay/submission/existing/status");
+                    (200, serde_json::json!({"requestId":"existing","status":"included"}))
+                })
+            })
+            .await;
+            let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+            let existing = client
+                .submit(
+                    curvy_abi::RelayAction::Aggregation,
+                    100,
+                    2,
+                    &proof(),
+                    &[],
+                    "request",
+                    "spend",
+                    "intent",
+                )
+                .await?;
+            assert_eq!(existing.request_id, "existing");
+            assert!(
+                client
+                    .await_inclusion(existing, Duration::from_secs(5))
+                    .await?
+                    .status
+                    .is_on_chain()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_conflicts_remain_uncertain_and_other_client_errors_reject() -> anyhow::Result<()> {
+        for code in [409, 400] {
+            let server = Server::new(move |_, _| Some((code, serde_json::json!({"error":"bad request"})))).await;
+            let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+            let error = client
+                .submit(
+                    curvy_abi::RelayAction::Aggregation,
+                    100,
+                    2,
+                    &proof(),
+                    &[],
+                    "request",
+                    "spend",
+                    "intent",
+                )
+                .await
+                .unwrap_err();
+            if code == 409 {
+                assert!(matches!(error, RelayError::Transport(_)));
+            } else {
+                assert!(matches!(error, RelayError::Rejected(_)));
+            }
+        }
+        Ok(())
     }
 }
