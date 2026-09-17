@@ -610,6 +610,7 @@ impl CurvyIndexSource for ScriptedIndex {
 #[derive(Default)]
 struct RecordingAdapter {
     funded: parking_lot::Mutex<Vec<(HoprBalance, Address)>>,
+    funding_finality_failures: parking_lot::Mutex<usize>,
     /// How many upcoming `allocate` calls answer "not in the committed tree yet".
     tree_lag_failures: parking_lot::Mutex<usize>,
     /// Every `allocate` call, successful or not.
@@ -651,6 +652,13 @@ impl CurvySdkAdapter for RecordingAdapter {
 
     async fn ensure_funded(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error> {
         self.funded.lock().push((gross, recovery_address));
+        let mut waiting = self.funding_finality_failures.lock();
+        if *waiting > 0 {
+            *waiting -= 1;
+            return Err(ScriptedFailure(
+                super::sdk::RsSdkCurvyAdapterError::RelayFinalityPending.to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -1054,6 +1062,21 @@ async fn pool_transfer_is_not_supported() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[test_log::test(tokio::test)]
+async fn a_deposit_waits_for_finality_before_funding() -> anyhow::Result<()> {
+    let adapter = RecordingAdapter::consistent();
+    *adapter.funding_finality_failures.lock() = 2;
+    let harness = harness(adapter, Duration::from_secs(2)).await?;
+    let id = pix_id(1);
+    let owner = BjjKeypair::random();
+    let data = harness.pool.generate_deposit_data(&id).await?;
+    harness.pool.deposit_funds_to(&id, owner.public(), ten(), data).await?;
+    assert_eq!(harness.adapter.funded.lock().len(), 3);
+    assert_eq!(*harness.adapter.allocate_attempts.lock(), 1);
+    assert_eq!(harness.adapter.allocations.lock().len(), 1);
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
 async fn a_deposit_waits_for_the_committed_tree_instead_of_failing() -> anyhow::Result<()> {
     // The funding note is on chain but the SDK's tree does not have it yet: two early attempts,
     // then it is there. On a relayed deployment this is the normal shape of the first deposit.
@@ -1150,6 +1173,20 @@ async fn a_tree_that_never_catches_up_fails_within_the_tracking_budget() -> anyh
 
 #[test]
 fn tree_lag_is_recognised_and_polled_at_a_tenth_of_the_budget() {
+    use super::{relayer::RelayError, sdk::RsSdkCurvyAdapterError};
+
+    assert!(super::is_retryable_lag(
+        &RsSdkCurvyAdapterError::RelayFinalityPending.to_string()
+    ));
+    assert!(super::is_retryable_lag(
+        &RelayError::RateLimited("429".into()).to_string()
+    ));
+    assert!(!super::is_retryable_lag(
+        &RelayError::AccessDenied("401".into()).to_string()
+    ));
+    assert!(!super::is_retryable_lag(
+        &RsSdkCurvyAdapterError::RelayFinalityUnavailable("no checkpoint".into()).to_string()
+    ));
     assert!(super::is_tree_lag(TREE_LAG));
     assert!(super::is_tree_lag(
         "sync: index did not reconcile after retries: 1 indexed leaves ..."

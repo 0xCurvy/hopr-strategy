@@ -1163,10 +1163,6 @@ where
     ) -> Result<(), StrategyError> {
         self.ensure_reconciled().await?;
         let safe_address = self.node.identity().safe_address;
-        self.adapter
-            .ensure_funded(self.initial_funding, safe_address)
-            .await
-            .map_err(|error| StrategyError::other(CurvyDepositPoolError::Adapter(error.into())))?;
         // The funding note has to be *committed* before it can be spent, and committed by
         // whoever commits on this deployment: under `submission: relayer` that is the shared
         // batch-prover, on its own schedule, and the SDK's tree — read from a finalized
@@ -1177,8 +1173,19 @@ where
         let deadline = tokio::time::Instant::now() + self.cfg.max_deposit_tracking_time;
         let poll = tree_lag_poll_interval(self.cfg.max_deposit_tracking_time);
         let mut waited = 0u32;
+        let mut funded = false;
         loop {
-            match self.adapter.allocate(deposits.clone()).await {
+            let result = async {
+                // Reconciliation can await finality before funding as well as before allocation.
+                // Retry here so the adapter's chain lock is released during the delay.
+                if !funded {
+                    self.adapter.ensure_funded(self.initial_funding, safe_address).await?;
+                    funded = true;
+                }
+                self.adapter.allocate(deposits.clone()).await
+            }
+            .await;
+            match result {
                 Ok(()) => {
                     if waited > 0 {
                         tracing::info!(
@@ -1220,7 +1227,9 @@ where
 /// disagreed while a commitment was still settling — rather than a fault. Matched on text because
 /// the SDK reports both as opaque `anyhow` messages.
 fn is_tree_lag(message: &str) -> bool {
-    message.contains("not found in committed tree") || message.contains("index did not reconcile")
+    message.contains("not found in committed tree")
+        || message.contains("index did not reconcile")
+        || message.contains("waiting for the winning Curvy aggregation outputs to become finalized")
 }
 
 /// A chain read that failed on the way to the RPC rather than in the protocol: a rate limit or a
@@ -1231,6 +1240,7 @@ fn is_transient_chain_read(message: &str) -> bool {
         || message.contains("Max retries exceeded")
         || message.contains("HTTP error 429")
         || message.contains("HTTP error 5")
+        || message.contains("the Curvy relayer rate limited the request:")
         // The gate re-priced gas between the quote and the proof; the next attempt re-quotes.
         || message.contains("operator note does not cover the gas cost")
         // A truncated or reset response from the gateway or the indexer, on the way to a read.
