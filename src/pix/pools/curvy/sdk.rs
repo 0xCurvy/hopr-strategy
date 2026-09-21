@@ -869,10 +869,11 @@ where
         let store = RedbCurvySdkStore::new(state)?;
         let mut persisted = store.load()?;
         let spender = match &persisted.spender {
-            Some(spender) => Account::from_meta_keys(&spender.k, &spender.v)?,
+            Some(spender) => Account::from_meta_keys(&full_width_spend_key(&spender.k), &spender.v)?,
             None => {
                 let (k, v, ..) =
                     stealth::new_meta().map_err(|error| RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("{error}")))?;
+                let k = full_width_spend_key(&k);
                 let spender = Account::from_meta_keys(&k, &v)?;
                 persisted.spender = Some(StoredSpender { k, v });
                 store.save(&persisted)?;
@@ -2248,6 +2249,16 @@ fn exact_note_subset(values: &[u128], target: u128, budget: usize) -> Option<Vec
     let mut steps = budget;
     let mut picked = Vec::new();
     search(values, &suffix, 0, target, &mut steps, &mut picked).then_some(picked)
+}
+
+/// Left-pads a spend private key to the 64 hex digits the SDK requires.
+///
+/// `stealth::new_meta` prints the scalar without leading zero bytes, so roughly one key in 256
+/// comes out shorter than 32 bytes, and `Account::from_meta_keys` parses the spend key as exactly
+/// 32 — a fresh node then failed to start depending on its random draw. The padding changes the
+/// encoding only: the scalar, and so every key derived from it, is the same.
+fn full_width_spend_key(k: &str) -> String {
+    format!("{k:0>64}")
 }
 
 fn note_id(note: &OwnedNote) -> String {
@@ -3837,6 +3848,20 @@ mod tests {
         let recipient = StoredAllocation::recipient(&committed.deposit.address, key)?;
         assert_eq!(recipient.viewer.big_k, big_k);
         assert_eq!(recipient.viewer.big_v, big_v);
+        Ok(())
+    }
+
+    #[test]
+    fn a_short_spend_key_is_padded_to_the_width_the_sdk_parses() -> anyhow::Result<()> {
+        // A valid scalar whose top byte is zero, as `new_meta` prints one: 31 bytes.
+        let short = "01".repeat(31);
+        let view = "02".repeat(32);
+        assert!(Account::from_meta_keys(&short, &view).is_err());
+        let padded = full_width_spend_key(&short);
+        assert_eq!(padded, format!("00{short}"));
+        let account = Account::from_meta_keys(&padded, &view)?;
+        assert_eq!(account.big_k, stealth::get_meta(&short, &view)?.0);
+        assert_eq!(full_width_spend_key(&padded), padded);
         Ok(())
     }
 
