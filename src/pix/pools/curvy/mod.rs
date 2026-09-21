@@ -679,15 +679,19 @@ where
 {
     let submitter = Arc::new(module::SafeModuleSubmitter::new(client, chain_key, module_address));
     Arc::new(
-        move |calldata: Vec<u8>, token: Address, vault: Address, aggregator: Address, gross: u128| {
+        move |calldata: Vec<u8>,
+              token: Address,
+              vault: Address,
+              aggregator: Address,
+              gross: u128,
+              landed: sdk::ShieldLanded| {
             let submitter = Arc::clone(&submitter);
             Box::pin(async move {
                 let bundle =
                     module::encode_safe_direct_shield(&multisend, &token, &vault, &aggregator, gross, calldata);
                 submitter
-                    .submit(bundle, SAFE_DIRECT_SHIELD_GAS)
+                    .submit(bundle, SAFE_DIRECT_SHIELD_GAS, landed)
                     .await
-                    .map(|_| ())
                     .map_err(|error| error.to_string())
             }) as BoxFuture<'static, Result<(), String>>
         },

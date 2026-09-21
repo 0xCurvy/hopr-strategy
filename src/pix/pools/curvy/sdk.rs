@@ -112,9 +112,17 @@ pub type PortalFunder = Arc<dyn Fn(Address, HoprBalance) -> BoxFuture<'static, R
 /// stays ignorant of how the Safe is driven.
 ///
 /// Arguments: the `directShield` calldata, the token, the vault to approve, the aggregator to
-/// call, and the gross amount to approve.
-pub type DirectShielder =
-    Arc<dyn Fn(Vec<u8>, Address, Address, Address, u128) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
+/// call, the gross amount to approve, and a check of whether the shield's note already exists —
+/// which the shielder consults before resubmitting after a nonce conflict, since an earlier copy
+/// of the same shield may be the transaction that took the nonce.
+pub type DirectShielder = Arc<
+    dyn Fn(Vec<u8>, Address, Address, Address, u128, ShieldLanded) -> BoxFuture<'static, Result<(), String>>
+        + Send
+        + Sync,
+>;
+
+/// Whether a direct shield's note is known to the aggregator, i.e. whether the shield executed.
+pub type ShieldLanded = Arc<dyn Fn() -> BoxFuture<'static, Result<bool, String>> + Send + Sync>;
 
 /// Curvy chain operations that require SDK knowledge.
 ///
@@ -996,8 +1004,22 @@ where
                 .parse()
                 .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("aggregator address: {error}")))?;
             let calldata = prepared.calldata()?;
+            let landed: ShieldLanded = {
+                let client = Arc::clone(client);
+                let note_id = prepared.note.note_id();
+                Arc::new(move || {
+                    let client = Arc::clone(&client);
+                    Box::pin(async move {
+                        client
+                            .note_status(&note_id)
+                            .await
+                            .map(|status| matches!(status, 1 | 2))
+                            .map_err(|error| error.to_string())
+                    })
+                })
+            };
             tracing::info!(%gross, %vault, "shielding the Curvy funding note directly from the Safe");
-            shielder(calldata, token, vault, aggregator, gross)
+            shielder(calldata, token, vault, aggregator, gross, landed)
                 .await
                 // A revert here is most often the one setup step nothing performs automatically,
                 // so the error says which rather than leaving an operator to decode a receipt.
@@ -2285,6 +2307,14 @@ mod tests {
     type Adapter = RsSdkCurvyAdapter<blokli_client::BlokliClient>;
 
     fn test_adapter(state: &RedbCurvyDepositState, url: Url) -> anyhow::Result<Adapter> {
+        test_adapter_with_shielder(state, url, None)
+    }
+
+    fn test_adapter_with_shielder(
+        state: &RedbCurvyDepositState,
+        url: Url,
+        shielder: Option<DirectShielder>,
+    ) -> anyhow::Result<Adapter> {
         // Stable full-width keys keep recovery tests independent of random SDK key
         // encodings that can omit leading zero bytes on a subsequent reload.
         let store = RedbCurvySdkStore::new(state)?;
@@ -2307,7 +2337,7 @@ mod tests {
             url.to_string(),
             config,
             Arc::new(|_, _| Box::pin(async { panic!("unexpected funding call") })),
-            None,
+            shielder,
             Some(Arc::new(RelayClient::new(
                 url.clone(),
                 std::time::Duration::from_secs(2),

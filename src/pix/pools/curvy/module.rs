@@ -32,6 +32,7 @@ use hopr_api::{
     types::{chain::payload::GasEstimation, crypto::prelude::Keypair, primitive::prelude::Address},
 };
 
+use super::sdk::ShieldLanded;
 use crate::errors::StrategyError;
 
 /// `execTransactionFromModule(address,uint256,bytes,uint8)`.
@@ -159,7 +160,9 @@ pub fn encode_safe_direct_shield(
 /// The mitigation is to **never raise the gas price**. A same-nonce transaction that does not
 /// outbid the pending one is rejected as underpriced rather than replacing it, so the worst case
 /// is that this shield fails and is retried — never that a node transaction is displaced. The
-/// retry below re-queries the nonce rather than incrementing a local guess, for the same reason.
+/// retry below re-queries the nonce rather than incrementing a local guess, for the same reason,
+/// and only after the contested nonce is mined and the call is confirmed not to have executed:
+/// see [`submit_reconciling_nonce_conflicts`].
 ///
 /// The exposure is one transaction, once: the shield happens lazily on the first deposit and the
 /// pool is funded thereafter.
@@ -171,6 +174,13 @@ pub struct SafeModuleSubmitter<C> {
 
 /// How many times to re-query the nonce and resubmit before giving up.
 const NONCE_RETRIES: usize = 3;
+/// How long to wait for a contested nonce to be mined before deciding whether to resubmit.
+///
+/// Whatever holds the nonce was priced at the chain's own quote, so it normally mines within a
+/// block or two; a minute is generous. Running out is not a failure of the shield, only a refusal
+/// to guess: nothing is resubmitted while the earlier transaction's outcome is unknown.
+const NONCE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const NONCE_SETTLE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl<C> SafeModuleSubmitter<C>
 where
@@ -185,53 +195,58 @@ where
     }
 
     /// Submits `calldata` to the module and waits for one confirmation.
-    pub async fn submit(&self, calldata: Vec<u8>, gas_limit: u64) -> Result<String, StrategyError> {
+    ///
+    /// Returns `Ok` either when this call's own transaction confirmed or when, after a nonce
+    /// conflict, `already_executed` reports that an earlier copy of the call took effect. A
+    /// confirmation says only that the *module call* was mined: the Safe reports a failed inner
+    /// call without reverting, so the caller still has to check the effect itself.
+    pub async fn submit(
+        &self,
+        calldata: Vec<u8>,
+        gas_limit: u64,
+        already_executed: ShieldLanded,
+    ) -> Result<(), StrategyError> {
         let signer = self.chain_key.public().to_address();
-        let mut last_error = None;
-        for attempt in 0..NONCE_RETRIES {
-            let (chain_id, gas) = self.chain_parameters(gas_limit).await?;
-            let nonce = self
-                .client
+        let transaction_count = || async move {
+            self.client
                 .query_transaction_count(&signer.into())
                 .await
-                .map_err(|error| StrategyError::other(anyhow::anyhow!("querying the node's nonce: {error}")))?;
-
-            let signed = curvy_abi::sign_eip1559_call(curvy_abi::Eip1559Call {
-                signer_secret: self.chain_key.secret().as_ref(),
-                to: self.module.into(),
-                calldata: calldata.clone(),
-                value: 0,
-                nonce,
-                gas_limit: gas.gas_limit,
-                max_fee_per_gas: gas.max_fee_per_gas,
-                max_priority_fee_per_gas: gas.max_priority_fee_per_gas,
-                chain_id,
-            })
-            .map_err(|error| StrategyError::other(anyhow::anyhow!("signing the Safe module call: {error}")))?;
-
-            match self.client.submit_and_confirm_transaction(&signed.0, 1).await {
-                Ok(receipt) => return Ok(format!("{:?}", receipt)),
-                Err(error) => {
-                    let message = error.to_string();
-                    if !is_nonce_conflict(&message) {
-                        return Err(StrategyError::other(anyhow::anyhow!(
-                            "submitting the Safe module call: {message}"
-                        )));
-                    }
-                    tracing::debug!(
-                        attempt = attempt + 1,
-                        nonce,
-                        %message,
-                        "the node's own connector took this nonce first; re-querying"
-                    );
-                    last_error = Some(message);
-                }
+                .map_err(|error| StrategyError::other(anyhow::anyhow!("querying the node's nonce: {error}")))
+        };
+        let send = |nonce: u64| {
+            let calldata = calldata.clone();
+            async move {
+                let (chain_id, gas) = self
+                    .chain_parameters(gas_limit)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let signed = curvy_abi::sign_eip1559_call(curvy_abi::Eip1559Call {
+                    signer_secret: self.chain_key.secret().as_ref(),
+                    to: self.module.into(),
+                    calldata,
+                    value: 0,
+                    nonce,
+                    gas_limit: gas.gas_limit,
+                    max_fee_per_gas: gas.max_fee_per_gas,
+                    max_priority_fee_per_gas: gas.max_priority_fee_per_gas,
+                    chain_id,
+                })
+                .map_err(|error| format!("signing the Safe module call: {error}"))?;
+                self.client
+                    .submit_and_confirm_transaction(&signed.0, 1)
+                    .await
+                    .map(|receipt| format!("0x{}", const_hex::encode(receipt)))
+                    .map_err(|error| error.to_string())
             }
-        }
-        Err(StrategyError::other(anyhow::anyhow!(
-            "the Safe module call lost the nonce race {NONCE_RETRIES} times, most recently: {}",
-            last_error.unwrap_or_else(|| "unknown".to_owned())
-        )))
+        };
+        submit_reconciling_nonce_conflicts(
+            transaction_count,
+            send,
+            already_executed,
+            NONCE_SETTLE_TIMEOUT,
+            NONCE_SETTLE_POLL,
+        )
+        .await
     }
 
     /// Chain id and gas, taken from Blokli exactly as the node's own connector takes them so that
@@ -279,6 +294,80 @@ fn is_nonce_conflict(message: &str) -> bool {
         .any(|marker| lowered.contains(marker))
 }
 
+/// The retry policy of [`SafeModuleSubmitter::submit`], apart from the signing, so it can be
+/// driven without a chain.
+///
+/// A nonce conflict is not proof that this call did not execute. "Already known" means an
+/// identical transaction — an earlier copy of this very call — is pending; "replacement
+/// underpriced" means *something* is pending at the nonce, possibly that copy; "nonce too low"
+/// means the nonce was mined, possibly by that copy. Signing the same call again at the next nonce
+/// in any of these cases could execute it twice, which for a shield pulls the float twice.
+///
+/// So before resubmitting, the contested nonce is waited out until it is mined (the transaction
+/// count is Blokli's `latest`, not `pending`, count), and only then is the chain asked whether the
+/// call took effect. Once the nonce is final, a copy that did not land by then never will.
+async fn submit_reconciling_nonce_conflicts<N, NF, S, SF>(
+    transaction_count: N,
+    send: S,
+    already_executed: ShieldLanded,
+    settle_timeout: std::time::Duration,
+    settle_poll: std::time::Duration,
+) -> Result<(), StrategyError>
+where
+    N: Fn() -> NF,
+    NF: Future<Output = Result<u64, StrategyError>>,
+    S: Fn(u64) -> SF,
+    SF: Future<Output = Result<String, String>>,
+{
+    let mut last_error = None;
+    for attempt in 0..NONCE_RETRIES {
+        let nonce = transaction_count().await?;
+        let message = match send(nonce).await {
+            Ok(hash) => {
+                tracing::info!(tx = %hash, nonce, "the Safe module call confirmed");
+                return Ok(());
+            }
+            Err(message) if is_nonce_conflict(&message) => message,
+            Err(message) => {
+                return Err(StrategyError::other(anyhow::anyhow!(
+                    "submitting the Safe module call: {message}"
+                )));
+            }
+        };
+        tracing::debug!(
+            attempt = attempt + 1,
+            nonce,
+            %message,
+            "nonce {nonce} is contested; waiting for it to be mined before deciding whether to resubmit"
+        );
+        let deadline = tokio::time::Instant::now() + settle_timeout;
+        while transaction_count().await? <= nonce {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(StrategyError::other(anyhow::anyhow!(
+                    "nonce {nonce} was still pending after {settle_timeout:?} ({message}); not resubmitting the Safe \
+                     module call while an earlier copy of it may yet land"
+                )));
+            }
+            tokio::time::sleep(settle_poll).await;
+        }
+        if already_executed()
+            .await
+            .map_err(|error| StrategyError::other(anyhow::anyhow!("checking whether the call executed: {error}")))?
+        {
+            tracing::info!(
+                nonce,
+                "an earlier copy of the Safe module call executed; not resubmitting"
+            );
+            return Ok(());
+        }
+        last_error = Some(message);
+    }
+    Err(StrategyError::other(anyhow::anyhow!(
+        "the Safe module call lost the nonce race {NONCE_RETRIES} times, most recently: {}",
+        last_error.unwrap_or_else(|| "unknown".to_owned())
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +382,121 @@ mod tests {
 
     // The vectors below were produced by an independent reference encoder rather than by this
     // code, so they check the encoding itself and not merely that it has not changed.
+
+    mod nonce_conflicts {
+        use std::{
+            sync::atomic::{AtomicBool, AtomicU64, Ordering},
+            time::Duration,
+        };
+
+        use parking_lot::Mutex;
+
+        use super::*;
+
+        const SETTLE: Duration = Duration::from_secs(60);
+        const POLL: Duration = Duration::from_secs(1);
+
+        /// A chain whose latest nonce is `count`, recording every nonce a transaction was sent at.
+        struct Chain {
+            count: AtomicU64,
+            sent: Mutex<Vec<u64>>,
+            executed: Arc<AtomicBool>,
+        }
+
+        impl Chain {
+            fn new(count: u64) -> Arc<Self> {
+                Arc::new(Self {
+                    count: AtomicU64::new(count),
+                    sent: Mutex::new(Vec::new()),
+                    executed: Arc::new(AtomicBool::new(false)),
+                })
+            }
+
+            fn landed(&self) -> ShieldLanded {
+                let executed = Arc::clone(&self.executed);
+                Arc::new(move || {
+                    let executed = executed.load(Ordering::SeqCst);
+                    Box::pin(async move { Ok(executed) })
+                })
+            }
+
+            async fn run(
+                self: &Arc<Self>,
+                outcome: impl Fn(&Self, u64) -> Result<String, String>,
+            ) -> Result<(), StrategyError> {
+                submit_reconciling_nonce_conflicts(
+                    || async { Ok(self.count.load(Ordering::SeqCst)) },
+                    |nonce| {
+                        self.sent.lock().push(nonce);
+                        let result = outcome(self, nonce);
+                        async move { result }
+                    },
+                    self.landed(),
+                    SETTLE,
+                    POLL,
+                )
+                .await
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_earlier_copy_that_lands_is_not_resubmitted() -> anyhow::Result<()> {
+            let chain = Chain::new(5);
+            // Our own earlier copy is pending at nonce 5; it mines a few seconds later.
+            let miner = {
+                let chain = Arc::clone(&chain);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    chain.executed.store(true, Ordering::SeqCst);
+                    chain.count.store(6, Ordering::SeqCst);
+                })
+            };
+            chain.run(|_, _| Err("already known".to_owned())).await?;
+            miner.await?;
+            assert_eq!(*chain.sent.lock(), vec![5], "signed once, never at nonce 6");
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_nonce_taken_by_another_transaction_is_retried_at_the_next() -> anyhow::Result<()> {
+            let chain = Chain::new(5);
+            chain
+                .run(|chain, nonce| {
+                    if nonce == 5 {
+                        // The node's connector mined something else at 5 first.
+                        chain.count.store(6, Ordering::SeqCst);
+                        Err("nonce too low".to_owned())
+                    } else {
+                        Ok("0xabc".to_owned())
+                    }
+                })
+                .await?;
+            assert_eq!(*chain.sent.lock(), vec![5, 6]);
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_nonce_that_never_settles_is_not_resubmitted() {
+            let chain = Chain::new(5);
+            let error = chain
+                .run(|_, _| Err("replacement transaction underpriced".to_owned()))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("still pending"), "{error}");
+            assert_eq!(*chain.sent.lock(), vec![5]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn any_other_failure_is_reported_as_is() {
+            let chain = Chain::new(5);
+            let error = chain
+                .run(|_, _| Err("execution reverted".to_owned()))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("execution reverted"), "{error}");
+            assert_eq!(*chain.sent.lock(), vec![5]);
+        }
+    }
 
     #[test]
     fn a_module_call_matches_the_reference_encoding() {
