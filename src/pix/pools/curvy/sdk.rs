@@ -434,6 +434,22 @@ where
     })
 }
 
+/// One self-submitted aggregation, journalled with its private outputs before broadcast.
+///
+/// The operator path's counterpart to [`StoredRelayAggregation`]. Every attempt for one logical
+/// spend uses the same inputs and allocations, so the nullifiers let at most one of them land;
+/// the journal keeps each attempt's change and emitted notes until the winner is known, because
+/// until then any of them may be the one whose secrets are needed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredOperatorAggregation {
+    chain_id: u64,
+    aggregator: String,
+    inputs: Vec<StoredNote>,
+    change: StoredNote,
+    emitted: Vec<StoredNote>,
+    allocation_ids: Vec<[u8; PixAddressId::SIZE]>,
+}
+
 #[derive(Debug)]
 struct RelayAggregationOutcome {
     request_id: Option<String>,
@@ -592,6 +608,10 @@ struct SdkState {
     legacy_allocations: Vec<StoredAllocation>,
     #[serde(default)]
     ambiguous_allocation_ids: Vec<[u8; PixAddressId::SIZE]>,
+    /// Self-submitted aggregations whose outcome is not yet known; see
+    /// [`StoredOperatorAggregation`].
+    #[serde(default)]
+    operator_aggregations: Vec<StoredOperatorAggregation>,
 }
 
 struct RedbCurvySdkStore {
@@ -1486,9 +1506,12 @@ where
         &self,
         pending: &StoredRelayAggregation,
     ) -> Result<(), RsSdkCurvyAdapterError> {
+        self.check_outputs_finalized(&pending.emitted).await
+    }
+
+    async fn check_outputs_finalized(&self, emitted: &[StoredNote]) -> Result<(), RsSdkCurvyAdapterError> {
         let (client, _) = self.client().await?;
-        let ids = pending
-            .emitted
+        let ids = emitted
             .iter()
             .map(|stored| Ok(fr_to_dec(&OwnedNote::try_from(stored)?.note_id())))
             .collect::<Result<Vec<_>, RsSdkCurvyAdapterError>>()?;
@@ -1775,6 +1798,214 @@ where
         }
     }
 
+    /// Journals a self-submitted aggregation, then submits it.
+    ///
+    /// The attempt's inputs and private outputs — and the allocation records — become durable
+    /// *before* the SDK broadcasts, so a crash at any later point leaves something to reconcile
+    /// against the chain instead of an allocation with no recovery data. A replacement must
+    /// preserve the inputs and allocations of the attempts it competes with: that is what lets
+    /// the nullifiers guarantee at most one of them lands.
+    async fn submit_operator_aggregation(
+        &self,
+        client: &CurvyClient,
+        endpoints: &CurvyChainEndpoints,
+        request: curvy_sdk::PixAggregationRequest,
+        inputs: &[OwnedNote],
+        records: &[StoredAllocation],
+    ) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
+        let index = {
+            let mut current = self.state.lock();
+            let attempt = StoredOperatorAggregation {
+                chain_id: endpoints.chain_id,
+                aggregator: endpoints.aggregator.clone(),
+                inputs: inputs.iter().map(StoredNote::from).collect(),
+                change: StoredNote::from(&request.change),
+                emitted: request
+                    .emitted_notes
+                    .iter()
+                    .filter(|note| note.amount != Fr::from(0u8))
+                    .map(StoredNote::from)
+                    .collect(),
+                allocation_ids: records.iter().map(|record| record.id).collect(),
+            };
+            if let Some(previous) = current.operator_aggregations.last()
+                && (previous.inputs != attempt.inputs
+                    || previous.allocation_ids != attempt.allocation_ids
+                    || previous.chain_id != attempt.chain_id
+                    || !previous.aggregator.eq_ignore_ascii_case(&attempt.aggregator))
+            {
+                return Err(RsSdkCurvyAdapterError::InvalidValue(
+                    "a replacement aggregation must preserve its deployment, inputs and allocations".to_owned(),
+                ));
+            }
+            if current.operator_aggregations.len() >= MAX_RELAY_AGGREGATION_ATTEMPTS {
+                return Err(RsSdkCurvyAdapterError::RelayAttemptLimit);
+            }
+            let mut next = current.clone();
+            next.operator_aggregations.push(attempt);
+            self.store.save_update(&next, records, &[])?;
+            *current = next;
+            current.operator_aggregations.len() - 1
+        };
+        match client
+            .submit_pix_aggregation(request, &self.config.operator_private_key, self.config.route)
+            .await
+        {
+            Ok(result) => {
+                if index > 0 {
+                    // Earlier attempts spent the same inputs; only a finalized tree rules out a
+                    // reorg that lets one of them win after all.
+                    let emitted = self.state.lock().operator_aggregations[index].emitted.clone();
+                    self.check_outputs_finalized(&emitted).await?;
+                }
+                self.finish_operator_aggregation(Some(index))?;
+                for entry in &result.ledger {
+                    tracing::info!(tx = %entry.tx_hash, allocations = records.len(), "aggregated Curvy PIX allocations");
+                }
+                Ok(result.ledger)
+            }
+            Err(error) => {
+                if curvy_sdk::ambiguous_pix_aggregation(&error).is_none()
+                    && curvy_sdk::ambiguous_submission(&error).is_none()
+                {
+                    // The SDK knows this attempt did not land. Earlier ones still may.
+                    self.drop_operator_attempt(index)?;
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Settles the journal: `Some(winner)` books that attempt's outputs and completes its
+    /// allocations; `None` releases the inputs and forgets the allocations, which is only sound
+    /// when no attempt can land.
+    fn finish_operator_aggregation(&self, winner: Option<usize>) -> Result<(), RsSdkCurvyAdapterError> {
+        let mut current = self.state.lock();
+        let Some(attempt) = current.operator_aggregations.get(winner.unwrap_or(0)).cloned() else {
+            return Ok(());
+        };
+        let mut next = current.clone();
+        next.operator_aggregations.clear();
+        let (completed, remove) = if winner.is_some() {
+            next.funding.retain(|note| !attempt.inputs.contains(note));
+            if OwnedNote::try_from(&attempt.change)?.amount != Fr::from(0u8) {
+                next.funding.push(attempt.change.clone());
+            }
+            next.pending.extend(attempt.emitted.clone());
+            (self.store.completed_allocations(&attempt.allocation_ids)?, Vec::new())
+        } else {
+            (Vec::new(), attempt.allocation_ids.clone())
+        };
+        self.store.save_update(&next, &completed, &remove)?;
+        *current = next;
+        Ok(())
+    }
+
+    /// Forgets one attempt the SDK reported as definitively failed; the last one out also
+    /// releases the inputs and allocations.
+    fn drop_operator_attempt(&self, index: usize) -> Result<(), RsSdkCurvyAdapterError> {
+        if self.state.lock().operator_aggregations.len() == 1 {
+            return self.finish_operator_aggregation(None);
+        }
+        let mut current = self.state.lock();
+        let mut next = current.clone();
+        next.operator_aggregations.remove(index);
+        self.store.save(&next)?;
+        *current = next;
+        Ok(())
+    }
+
+    /// Resolves a journalled self-submitted aggregation before anything else spends funding.
+    ///
+    /// An attempt whose outputs the chain knows is the winner and is booked. When none is
+    /// known — the process stopped after journalling, before or after broadcast — a replacement
+    /// is proved over the same inputs and allocations and submitted: if an earlier copy is still
+    /// on its way, the two share nullifiers and only one can land, and the journal keeps both
+    /// sets of outputs until the chain says which. Called with the chain lock held.
+    async fn reconcile_operator_aggregation(&self) -> Result<(), RsSdkCurvyAdapterError> {
+        self.reconcile_operator_aggregation_with(|| async { self.retry_operator_aggregation().await.map(|_| ()) })
+            .await
+    }
+
+    async fn reconcile_operator_aggregation_with<F, Fut>(&self, retry: F) -> Result<(), RsSdkCurvyAdapterError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), RsSdkCurvyAdapterError>>,
+    {
+        let attempts = self.state.lock().operator_aggregations.clone();
+        if attempts.is_empty() {
+            return Ok(());
+        }
+        let (_, endpoints) = self.client().await?;
+        if attempts.iter().any(|attempt| {
+            endpoints.chain_id != attempt.chain_id || !endpoints.aggregator.eq_ignore_ascii_case(&attempt.aggregator)
+        }) {
+            return Err(RsSdkCurvyAdapterError::InvalidValue(
+                "pending aggregation belongs to another deployment".to_owned(),
+            ));
+        }
+        for (index, attempt) in attempts.iter().enumerate() {
+            if self.notes_known(&attempt.emitted).await? {
+                if attempts.len() > 1 {
+                    self.check_outputs_finalized(&attempt.emitted).await?;
+                }
+                self.finish_operator_aggregation(Some(index))?;
+                tracing::info!(
+                    allocations = attempt.allocation_ids.len(),
+                    "a journalled Curvy PIX aggregation landed"
+                );
+                return self.recover_pending().await.map(|_| ());
+            }
+        }
+        if attempts.len() >= MAX_RELAY_AGGREGATION_ATTEMPTS {
+            return Err(RsSdkCurvyAdapterError::RelayAttemptLimit);
+        }
+        retry().await
+    }
+
+    /// Proves and submits a replacement for the journalled aggregation, over its inputs.
+    async fn retry_operator_aggregation(&self) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
+        let pending = self
+            .state
+            .lock()
+            .operator_aggregations
+            .last()
+            .cloned()
+            .ok_or(RsSdkCurvyAdapterError::AmbiguousAllocation)?;
+        let inputs = pending
+            .inputs
+            .iter()
+            .map(OwnedNote::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let records = pending
+            .allocation_ids
+            .iter()
+            .map(|id| {
+                self.store.allocation(id)?.ok_or_else(|| {
+                    RsSdkCurvyAdapterError::InvalidValue("missing prepared allocation record".to_owned())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let allocations = records
+            .iter()
+            .map(StoredAllocation::prover_allocation)
+            .collect::<Result<Vec<_>, RsSdkCurvyAdapterError>>()?;
+        let (client, endpoints) = self.client().await?;
+        let fee_recipient = self.fee_recipient().await?;
+        tracing::info!(
+            attempts = self.state.lock().operator_aggregations.len(),
+            "no journalled Curvy PIX aggregation landed; proving a replacement over the same inputs"
+        );
+        let request = client
+            .build_pix_aggregation(&self.spender, &inputs, &allocations, None, fee_recipient.as_ref())
+            .await?;
+        let mut ledger = self
+            .submit_operator_aggregation(client, endpoints, request, &inputs, &records)
+            .await?;
+        ledger.extend(self.recover_pending().await?);
+        Ok(ledger)
+    }
+
     /// Records an intent before submitting under it, and clears it once the outcome is known.
     fn journal_intent(&self, intent: &str, action: &str, spend_key: &str) -> Result<(), RsSdkCurvyAdapterError> {
         let mut state = self.state.lock();
@@ -1869,7 +2100,27 @@ where
         if ambiguous && !self.reconcile_ambiguous_allocation().await? {
             return Err(RsSdkCurvyAdapterError::AmbiguousAllocation);
         }
+        self.reconcile_operator_aggregation().await?;
         let deposits = {
+            // Every journal has been reconciled above, so a prepared record none of them names
+            // was never submitted: its preparation was interrupted before the attempt was
+            // journalled. It is prepared again rather than blocking the allocation for good.
+            let journalled = {
+                let state = self.state.lock();
+                state
+                    .relay_aggregations
+                    .iter()
+                    .flat_map(|attempt| attempt.allocation_ids.iter())
+                    .chain(
+                        state
+                            .operator_aggregations
+                            .iter()
+                            .flat_map(|attempt| attempt.allocation_ids.iter()),
+                    )
+                    .chain(state.ambiguous_allocation_ids.iter())
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+            };
             let mut pending = Vec::new();
             for (id, address, scan_key, amount) in deposits {
                 if let Some(existing) = self.store.allocation(&id_bytes(id))? {
@@ -1878,8 +2129,11 @@ where
                     }
                     match existing.stage {
                         StoredAllocationStage::Completed => continue,
-                        StoredAllocationStage::Prepared => {
+                        StoredAllocationStage::Prepared if journalled.contains(&existing.id) => {
                             return Err(RsSdkCurvyAdapterError::AmbiguousAllocation);
+                        }
+                        StoredAllocationStage::Prepared => {
+                            tracing::info!(allocation = ?id, "re-preparing an allocation that was never submitted");
                         }
                     }
                 }
@@ -1950,12 +2204,8 @@ where
                 .iter()
                 .map(|(id, address, scan_key, amount)| StoredAllocation::new(*id, address, *scan_key, *amount))
                 .collect::<Result<Vec<_>, _>>()?;
-            if self.config.submission == CurvySubmission::Operator {
-                let state = self.state.lock();
-                self.store.save_update(&state, &allocation_records, &[])?;
-            }
             let funding_notes = funding.iter().map(|(_, note, _)| note.clone()).collect::<Vec<_>>();
-            let aggregated = client
+            let request = client
                 .build_pix_aggregation(
                     &self.spender,
                     &funding_notes,
@@ -1963,82 +2213,18 @@ where
                     relay_fee.as_ref().map(|(identity, amount)| (identity, *amount)),
                     fee_recipient.as_ref(),
                 )
-                .await;
-            let aggregated = match aggregated {
-                Ok(request) => match (self.config.submission, self.relay.as_ref()) {
-                    (CurvySubmission::Relayer, Some(_)) => {
-                        self.prepare_relay_aggregation(&request, endpoints, &funding_notes, &allocation_records)?;
-                        // Errors retain the exact request and its outputs. They must not enter
-                        // the operator SDK's generic cleanup path below.
-                        self.reconcile_relay_aggregation().await?;
-                        receipts.extend(self.recover_pending().await?);
-                        continue;
-                    }
-                    _ => {
-                        client
-                            .submit_pix_aggregation(request, &self.config.operator_private_key, self.config.route)
-                            .await
-                    }
-                },
-                Err(error) => Err(error),
-            };
-            let result = match aggregated {
-                Ok(result) => result,
-                Err(error) => {
-                    if let Some(ambiguous) = curvy_sdk::ambiguous_pix_aggregation(&error) {
-                        let mut state = self.state.lock();
-                        state.ambiguous_allocation = true;
-                        state.ambiguous_inputs = funding.iter().map(|(stored, ..)| stored.clone()).collect();
-                        state.ambiguous_change = Some(StoredNote::from(&ambiguous.result.change));
-                        state.ambiguous_emitted = ambiguous
-                            .result
-                            .emitted_notes
-                            .iter()
-                            .filter(|note| note.amount != Fr::from(0_u8))
-                            .map(StoredNote::from)
-                            .collect();
-                        state.ambiguous_allocation_ids = allocation_records.iter().map(|record| record.id).collect();
-                        self.store.save(&state)?;
-                    } else if curvy_sdk::ambiguous_submission(&error).is_some() {
-                        let mut state = self.state.lock();
-                        state.ambiguous_allocation = true;
-                        state.ambiguous_allocation_ids = allocation_records.iter().map(|record| record.id).collect();
-                        self.store.save(&state)?;
-                    } else {
-                        let state = self.state.lock();
-                        let ids = allocation_records.iter().map(|record| record.id).collect::<Vec<_>>();
-                        self.store.save_update(&state, &[], &ids)?;
-                    }
-                    return Err(error.into());
-                }
-            };
-            {
-                let mut state = self.state.lock();
-                state
-                    .funding
-                    .retain(|note| !funding.iter().any(|(stored, ..)| stored == note));
-                state.funding.push(StoredNote::from(&result.change));
-                state.pending.extend(
-                    result
-                        .emitted_notes
-                        .iter()
-                        .filter(|note| note.amount != Fr::from(0_u8))
-                        .map(StoredNote::from),
-                );
-                let ids = allocation_records.iter().map(|record| record.id).collect::<Vec<_>>();
-                let completed = self.store.completed_allocations(&ids)?;
-                self.store.save_update(&state, &completed, &[])?;
-            }
-            for entry in &result.ledger {
-                tracing::info!(
-                    tx = %entry.tx_hash,
-                    allocations = chunk.len(),
-                    "aggregated Curvy PIX allocations"
+                .await?;
+            if self.config.submission == CurvySubmission::Relayer {
+                self.prepare_relay_aggregation(&request, endpoints, &funding_notes, &allocation_records)?;
+                // Errors retain the exact request and its outputs.
+                self.reconcile_relay_aggregation().await?;
+            } else {
+                receipts.extend(
+                    self.submit_operator_aggregation(client, endpoints, request, &funding_notes, &allocation_records)
+                        .await?,
                 );
             }
-            let mut ledger = result.ledger;
-            ledger.extend(self.recover_pending().await?);
-            receipts.extend(ledger);
+            receipts.extend(self.recover_pending().await?);
         }
         Ok(receipts)
     }
@@ -2358,6 +2544,20 @@ mod tests {
         url: Url,
         shielder: Option<DirectShielder>,
     ) -> anyhow::Result<Adapter> {
+        test_adapter_with(state, url, shielder, CurvySubmission::Relayer)
+    }
+
+    /// Self-submitting, with no relayer at all.
+    fn operator_adapter(state: &RedbCurvyDepositState, url: Url) -> anyhow::Result<Adapter> {
+        test_adapter_with(state, url, None, CurvySubmission::Operator)
+    }
+
+    fn test_adapter_with(
+        state: &RedbCurvyDepositState,
+        url: Url,
+        shielder: Option<DirectShielder>,
+        submission: CurvySubmission,
+    ) -> anyhow::Result<Adapter> {
         // Stable full-width keys keep recovery tests independent of random SDK key
         // encodings that can omit leading zero bytes on a subsequent reload.
         let store = RedbCurvySdkStore::new(state)?;
@@ -2370,9 +2570,13 @@ mod tests {
             store.save(&persisted)?;
         }
         let blokli = Arc::new(blokli_client::BlokliClient::new(url.clone(), Default::default()));
-        let config = RsSdkCurvyAdapterConfig::new(String::new(), 4).with_modes(
+        let operator_key = match submission {
+            CurvySubmission::Relayer => String::new(),
+            CurvySubmission::Operator => format!("0x{}", "11".repeat(32)),
+        };
+        let config = RsSdkCurvyAdapterConfig::new(operator_key, 4).with_modes(
             CurvyShielding::Direct,
-            CurvySubmission::Relayer,
+            submission,
             Some(url.clone()),
         );
         let adapter = Adapter::new(
@@ -2381,10 +2585,13 @@ mod tests {
             config,
             Arc::new(|_, _| Box::pin(async { panic!("unexpected funding call") })),
             shielder,
-            Some(Arc::new(RelayClient::new(
-                url.clone(),
-                std::time::Duration::from_secs(2),
-            )?)),
+            match submission {
+                CurvySubmission::Relayer => Some(Arc::new(RelayClient::new(
+                    url.clone(),
+                    std::time::Duration::from_secs(2),
+                )?)),
+                CurvySubmission::Operator => None,
+            },
             state,
         )?;
         let endpoints = CurvyChainEndpoints {
@@ -2650,6 +2857,224 @@ mod tests {
         let encoded = read.open_table(SDK_STATE_TABLE)?.get(SDK_STATE_KEY)?.unwrap().value();
         assert_eq!(encoded, serde_json::to_vec(&state)?);
         assert!(encoded.len() < 1000);
+        Ok(())
+    }
+
+    /// An operator attempt journalled with the given inputs, outputs and allocations.
+    fn operator_attempt(
+        inputs: &[u64],
+        change: u64,
+        emitted: &[u64],
+        allocation_ids: Vec<[u8; PixAddressId::SIZE]>,
+    ) -> anyhow::Result<StoredOperatorAggregation> {
+        let stored = |amount: u64| -> anyhow::Result<StoredNote> {
+            Ok(StoredNote::from(&Adapter::owned_note(&fixture(amount))?))
+        };
+        Ok(StoredOperatorAggregation {
+            chain_id: 100,
+            aggregator: format!("0x{}", "01".repeat(20)),
+            inputs: inputs.iter().map(|amount| stored(*amount)).collect::<Result<_, _>>()?,
+            change: stored(change)?,
+            emitted: emitted.iter().map(|amount| stored(*amount)).collect::<Result<_, _>>()?,
+            allocation_ids,
+        })
+    }
+
+    fn prepared_record(
+        amount: u64,
+    ) -> anyhow::Result<(
+        StoredAllocation,
+        (PixAddressId, BjjPublicKey, CurvyScanPublicKey, HoprBalance),
+    )> {
+        let note = fixture(amount);
+        let key = scan_key("07", "0b")?;
+        let record = StoredAllocation::new(note.deposit.id, &note.deposit.address, key, note.deposit.amount)?;
+        Ok((
+            record,
+            (note.deposit.id, note.deposit.address, key, note.deposit.amount),
+        ))
+    }
+
+    /// A process that stopped while proving leaves a prepared record and no journal: nothing was
+    /// broadcast, so the allocation is prepared again instead of being refused for good.
+    #[tokio::test]
+    async fn an_interrupted_operator_preparation_is_prepared_again() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let reached_chain = Arc::new(AtomicBool::new(false));
+        let server = relayer::http_tests::Server::new({
+            let reached_chain = reached_chain.clone();
+            move |_, _| {
+                reached_chain.store(true, Ordering::SeqCst);
+                Some((500, serde_json::json!({"error": "stop here"})))
+            }
+        })
+        .await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let (record, deposit) = prepared_record(7)?;
+        {
+            let adapter = operator_adapter(&state, server.url.clone())?;
+            adapter.store.save_update(&adapter.state.lock(), &[record], &[])?;
+        }
+        // Reopened, as after a restart.
+        let adapter = operator_adapter(&state, server.url.clone())?;
+        let error = adapter.allocate_all(&[deposit]).await.unwrap_err();
+        assert!(!matches!(error, RsSdkCurvyAdapterError::AmbiguousAllocation), "{error}");
+        assert!(reached_chain.load(Ordering::SeqCst), "went on to price the allocation");
+        Ok(())
+    }
+
+    /// The attempt, its private outputs and its allocation records are durable before the SDK
+    /// sends anything; a definitive failure then releases them again.
+    #[tokio::test]
+    async fn an_operator_aggregation_is_journalled_before_it_is_broadcast() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let state = RedbCurvyDepositState::in_memory()?;
+        let store = RedbCurvySdkStore::new(&state)?;
+        let (record, _) = prepared_record(7)?;
+        let journalled = Arc::new(AtomicBool::new(false));
+        let server = relayer::http_tests::Server::new({
+            let journalled = journalled.clone();
+            let store = RedbCurvySdkStore::new(&state)?;
+            let id = record.id;
+            move |_, _| {
+                // The first thing the SDK does on the way to broadcasting is ask the chain.
+                let persisted = store.load().unwrap();
+                let recorded = store.allocation(&id).unwrap();
+                if persisted.operator_aggregations.len() == 1
+                    && recorded.is_some_and(|record| record.stage == StoredAllocationStage::Prepared)
+                {
+                    journalled.store(true, Ordering::SeqCst);
+                }
+                Some((500, serde_json::json!({"error": "rejected before broadcast"})))
+            }
+        })
+        .await;
+        let adapter = operator_adapter(&state, server.url.clone())?;
+        let input = Adapter::owned_note(&fixture(20))?;
+        let request = curvy_sdk::PixAggregationRequest {
+            proof: relayer::http_tests::proof(),
+            public_signals: vec!["1".to_owned()],
+            max_inputs: 2,
+            allocations: vec![Adapter::owned_note(&fixture(7))?],
+            change: Adapter::owned_note(&fixture(13))?,
+            relayer: None,
+            emitted_notes: vec![Adapter::owned_note(&fixture(7))?],
+            request_key: "operator".to_owned(),
+            spend_key: "0x1".to_owned(),
+        };
+        let (client, endpoints) = adapter.client().await?;
+        let error = adapter
+            .submit_operator_aggregation(client, endpoints, request, &[input], std::slice::from_ref(&record))
+            .await
+            .unwrap_err();
+        assert!(
+            journalled.load(Ordering::SeqCst),
+            "journalled before the first chain request: {error}"
+        );
+        let persisted = store.load()?;
+        assert!(
+            persisted.operator_aggregations.is_empty(),
+            "a definitive failure is released"
+        );
+        assert!(store.allocation(&record.id)?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_journalled_operator_aggregation_that_landed_is_booked_on_restart() -> anyhow::Result<()> {
+        let state = RedbCurvyDepositState::in_memory()?;
+        let store = RedbCurvySdkStore::new(&state)?;
+        let (record, _) = prepared_record(7)?;
+        let attempt = operator_attempt(&[20], 13, &[7], vec![record.id])?;
+        let mut persisted = store.load()?;
+        persisted.funding = attempt.inputs.clone();
+        persisted.operator_aggregations = vec![attempt.clone()];
+        store.save_update(&persisted, std::slice::from_ref(&record), &[])?;
+
+        let known = attempt.emitted.clone();
+        let server =
+            relayer::http_tests::Server::new(move |_, body| Some(recovery_chain_response(&body, &known, true))).await;
+        let adapter = operator_adapter(&state, server.url.clone())?;
+        adapter
+            .reconcile_operator_aggregation_with(|| async { panic!("a landed attempt is not replaced") })
+            .await?;
+        let persisted = store.load()?;
+        assert_eq!(persisted.funding, vec![attempt.change], "inputs spent, change booked");
+        assert!(persisted.operator_aggregations.is_empty());
+        assert_eq!(
+            store.allocation(&record.id)?.unwrap().stage,
+            StoredAllocationStage::Completed
+        );
+        Ok(())
+    }
+
+    /// Nothing landed: whether the process stopped before or after broadcast is unknowable, so a
+    /// replacement over the same inputs is proved, and the earlier outputs are kept meanwhile.
+    #[tokio::test]
+    async fn a_journalled_operator_aggregation_that_did_not_land_is_replaced_over_the_same_inputs() -> anyhow::Result<()>
+    {
+        let state = RedbCurvyDepositState::in_memory()?;
+        let store = RedbCurvySdkStore::new(&state)?;
+        let (record, _) = prepared_record(7)?;
+        let attempt = operator_attempt(&[20], 13, &[7], vec![record.id])?;
+        let mut persisted = store.load()?;
+        persisted.funding = attempt.inputs.clone();
+        persisted.operator_aggregations = vec![attempt.clone()];
+        store.save_update(&persisted, std::slice::from_ref(&record), &[])?;
+
+        let server = relayer::http_tests::Server::new(|_, body| Some(recovery_chain_response(&body, &[], true))).await;
+        let adapter = operator_adapter(&state, server.url.clone())?;
+        let retried = std::sync::atomic::AtomicBool::new(false);
+        let error = adapter
+            .reconcile_operator_aggregation_with(|| async {
+                retried.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(RsSdkCurvyAdapterError::AmbiguousAllocation)
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RsSdkCurvyAdapterError::AmbiguousAllocation));
+        assert!(retried.load(std::sync::atomic::Ordering::SeqCst));
+        let persisted = store.load()?;
+        assert_eq!(
+            persisted.operator_aggregations.len(),
+            1,
+            "the earlier outputs stay journalled"
+        );
+        assert_eq!(persisted.funding, attempt.inputs, "the inputs stay reserved");
+        assert_eq!(
+            store.allocation(&record.id)?.unwrap().stage,
+            StoredAllocationStage::Prepared
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_replacement_keeps_the_earlier_attempt() -> anyhow::Result<()> {
+        let server = relayer::http_tests::Server::new(|_, _| panic!("no chain access needed")).await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = operator_adapter(&state, server.url.clone())?;
+        let (record, _) = prepared_record(7)?;
+        let first = operator_attempt(&[20], 13, &[7], vec![record.id])?;
+        let second = operator_attempt(&[20], 14, &[7], vec![record.id])?;
+        {
+            let mut current = adapter.state.lock();
+            current.funding = first.inputs.clone();
+            current.operator_aggregations = vec![first.clone(), second];
+            adapter
+                .store
+                .save_update(&current, std::slice::from_ref(&record), &[])?;
+        }
+        adapter.drop_operator_attempt(1)?;
+        let persisted = adapter.store.load()?;
+        assert_eq!(persisted.operator_aggregations.len(), 1);
+        assert_eq!(persisted.operator_aggregations[0].change, first.change);
+        assert!(adapter.store.allocation(&record.id)?.is_some());
+        // The last attempt out releases the allocation; the inputs were never spent.
+        adapter.drop_operator_attempt(0)?;
+        let persisted = adapter.store.load()?;
+        assert!(persisted.operator_aggregations.is_empty());
+        assert_eq!(persisted.funding, first.inputs);
+        assert!(adapter.store.allocation(&record.id)?.is_none());
         Ok(())
     }
 
