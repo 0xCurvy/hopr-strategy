@@ -26,9 +26,9 @@ use curvy_core::{
 use hopr_api::{
     ChainKeypair,
     chain::DepositPool,
-    node::{PixAddressId, PixDepositData},
+    node::{HasChainApi, PixAddressId, PixDepositData},
     types::{
-        crypto::prelude::{BjjKeypair, Bn254Keypair, CurvyScanPublicKey, CurvyScanSecret, Keypair},
+        crypto::prelude::{BjjKeypair, BjjPublicKey, Bn254Keypair, CurvyScanPublicKey, CurvyScanSecret, Keypair},
         crypto_random::Randomizable,
         internal::prelude::HoprPseudonym,
         primitive::prelude::{Address, HoprBalance, IntoEndian, U256, XDaiBalance},
@@ -36,12 +36,17 @@ use hopr_api::{
 };
 
 use super::{
-    CurvyNoteSource,
+    CommittedCurvyNote, CurvyDepositData, CurvyDepositPool, CurvyDepositPoolConfig, CurvyDepositState, CurvyEventKind,
+    CurvyIndexSource, CurvyNoteSource, CurvySdkAdapter, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome,
+    OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
     detect::{bjj_point, public_key_from_dec, scan_public_key_dec, shared_secret_from_scan_match},
     lifecycle::CurvyLifecycleTracker,
-    *,
+    validate_mode_requirements,
 };
-use crate::testing::{BlokliTestStateBuilder, ChainNode, create_test_blokli_connector};
+use crate::{
+    errors::StrategyError,
+    testing::{BlokliTestStateBuilder, ChainNode, create_test_blokli_connector},
+};
 
 // ---------------------------------------------------------------------------
 // Fixtures
