@@ -89,6 +89,8 @@ const MAX_COMMITMENTS_PER_PROOF: usize = 5;
 const MAX_WITHDRAWAL_INPUTS: usize = 10;
 /// An aggregation spends one or two committed input notes.
 const MAX_ALLOCATION_INPUTS: usize = 2;
+/// Search budget for an exact whole-note withdrawal; see `select_notes`.
+const MAX_NOTE_SELECTION_STEPS: usize = 1 << 16;
 /// Never evict an uncertain proof to make room: its private outputs may still be needed.
 const MAX_RELAY_AGGREGATION_ATTEMPTS: usize = 8;
 /// Three full inclusion waits without observed progress permit a replacement on the next call.
@@ -1991,6 +1993,12 @@ where
 
     /// Picks the notes to withdraw. Curvy cannot make change on a withdrawal, so a partial
     /// `amount` has to be an exact sum of whole notes.
+    ///
+    /// The exact subset is searched for rather than taken as a descending prefix: `[7, 5]` for
+    /// `5` must pick the `5`, which a greedy prefix never reaches. The search is bounded by
+    /// [`MAX_NOTE_SELECTION_STEPS`], because a deposit address holds a handful of notes and an
+    /// unbounded subset-sum over a pathological one is not worth stalling a sweep for. When
+    /// nothing exact is found, the greedy prefix is still what the error reports.
     fn select_notes(
         notes: Vec<CommittedCurvyNote>,
         amount: Option<HoprBalance>,
@@ -2001,33 +2009,39 @@ where
         };
         let target = balance_u128(target)?;
         notes.sort_by_key(|note| std::cmp::Reverse(fr_to_biguint(&note.amount)));
-        let mut selected = Vec::new();
-        let mut total = 0_u128;
-        for note in notes {
-            if total >= target {
-                break;
-            }
-            let value: u128 = fr_to_biguint(&note.amount)
-                .try_into()
-                .map_err(|_| RsSdkCurvyAdapterError::InvalidValue("note amount does not fit u128".to_owned()))?;
-            total = total
-                .checked_add(value)
-                .ok_or_else(|| RsSdkCurvyAdapterError::InvalidValue("note total overflows u128".to_owned()))?;
-            selected.push(note);
-        }
-        if total < target {
+        let values = notes
+            .iter()
+            .map(|note| {
+                u128::try_from(fr_to_biguint(&note.amount))
+                    .map_err(|_| RsSdkCurvyAdapterError::InvalidValue("note amount does not fit u128".to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let available = values.iter().try_fold(0_u128, |total, value| {
+            total
+                .checked_add(*value)
+                .ok_or_else(|| RsSdkCurvyAdapterError::InvalidValue("note total overflows u128".to_owned()))
+        })?;
+        if available < target {
             return Err(RsSdkCurvyAdapterError::InsufficientNotes {
                 requested: target,
-                available: total,
+                available,
             });
         }
-        if total != target {
-            return Err(RsSdkCurvyAdapterError::InexactWithdrawal {
-                requested: target,
-                selected: total,
-            });
+        if let Some(indices) = exact_note_subset(&values, target, MAX_NOTE_SELECTION_STEPS) {
+            let mut notes = notes.into_iter().map(Some).collect::<Vec<_>>();
+            return Ok(indices.into_iter().filter_map(|index| notes[index].take()).collect());
         }
-        Ok(selected)
+        let mut selected = 0_u128;
+        for value in &values {
+            if selected >= target {
+                break;
+            }
+            selected += value;
+        }
+        Err(RsSdkCurvyAdapterError::InexactWithdrawal {
+            requested: target,
+            selected,
+        })
     }
 
     async fn withdraw_notes(
@@ -2190,6 +2204,50 @@ where
 fn balance_u128(balance: HoprBalance) -> Result<u128, RsSdkCurvyAdapterError> {
     u128::try_from(balance.amount())
         .map_err(|_| RsSdkCurvyAdapterError::InvalidValue(format!("{balance} does not fit u128")))
+}
+
+/// Indices of a subset of `values` summing exactly to `target`, or `None` when there is none or
+/// the search runs out of `budget` steps.
+///
+/// `values` must be sorted descending and their total must fit `u128`. Depth-first over
+/// include/exclude, pruning a branch as soon as the values left cannot reach the target.
+fn exact_note_subset(values: &[u128], target: u128, budget: usize) -> Option<Vec<usize>> {
+    fn search(
+        values: &[u128],
+        suffix: &[u128],
+        start: usize,
+        remaining: u128,
+        steps: &mut usize,
+        picked: &mut Vec<usize>,
+    ) -> bool {
+        if remaining == 0 {
+            return true;
+        }
+        for index in start..values.len() {
+            if suffix[index] < remaining || *steps == 0 {
+                return false;
+            }
+            *steps -= 1;
+            if values[index] > remaining {
+                continue;
+            }
+            picked.push(index);
+            if search(values, suffix, index + 1, remaining - values[index], steps, picked) {
+                return true;
+            }
+            picked.pop();
+        }
+        false
+    }
+
+    // suffix[i] = values[i..].sum(); the trailing zero makes the bound total for every index.
+    let mut suffix = vec![0_u128; values.len() + 1];
+    for index in (0..values.len()).rev() {
+        suffix[index] = suffix[index + 1] + values[index];
+    }
+    let mut steps = budget;
+    let mut picked = Vec::new();
+    search(values, &suffix, 0, target, &mut steps, &mut picked).then_some(picked)
 }
 
 fn note_id(note: &OwnedNote) -> String {
@@ -3809,6 +3867,39 @@ mod tests {
             .sum::<u128>();
         assert_eq!(total, 13);
         Ok(())
+    }
+
+    #[test]
+    fn partial_withdrawal_finds_an_exact_note_outside_the_descending_prefix() -> anyhow::Result<()> {
+        let selected = Adapter::select_notes(vec![fixture(7), fixture(5)], Some(HoprBalance::from(U256::from(5_u8))))?;
+        let amounts = selected
+            .iter()
+            .map(|note| u128::try_from(fr_to_biguint(&note.amount)).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(amounts, vec![5]);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_withdrawal_finds_an_exact_combination_that_skips_the_largest_note() -> anyhow::Result<()> {
+        let selected = Adapter::select_notes(
+            vec![fixture(9), fixture(6), fixture(4), fixture(3)],
+            Some(HoprBalance::from(U256::from(10_u8))),
+        )?;
+        let mut amounts = selected
+            .iter()
+            .map(|note| u128::try_from(fr_to_biguint(&note.amount)).unwrap())
+            .collect::<Vec<_>>();
+        amounts.sort_unstable();
+        assert_eq!(amounts, vec![4, 6]);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_note_subset_gives_up_when_the_budget_runs_out() {
+        assert_eq!(exact_note_subset(&[9, 6, 4, 3], 10, 1_000), Some(vec![1, 2]));
+        assert_eq!(exact_note_subset(&[9, 6, 4, 3], 10, 2), None);
+        assert_eq!(exact_note_subset(&[9, 6, 4, 3], 11, 1_000), None);
     }
 
     fn fixture(amount: u64) -> CommittedCurvyNote {
