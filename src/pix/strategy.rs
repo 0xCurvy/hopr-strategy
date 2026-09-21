@@ -2828,6 +2828,36 @@ mod tests {
         Ok(())
     }
 
+    /// Direct shielding signs `execTransactionFromModule` with the node key, which the module's
+    /// `nodeOnly` check accepts from the node alone — so a foreign key is refused at startup
+    /// rather than reverting every shield.
+    #[cfg(feature = "strategy-pix-curvy")]
+    #[test_log::test(tokio::test)]
+    async fn test_build_curvy_rejects_a_foreign_node_key_for_direct_shielding() -> anyhow::Result<()> {
+        use hopr_api::types::crypto::prelude::BjjPublicKey;
+
+        let (_cc, node, _pool) = entry_side(&[]).await?;
+        let state = tempfile::tempdir()?;
+        let cfg = || crate::pix::pools::curvy::PoolConfig {
+            relayer_url: Some("http://127.0.0.1:1/".parse().unwrap()),
+            state_path: Some(state.path().join("curvy.redb")),
+            ..Default::default()
+        };
+
+        let result = PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(
+            Arc::clone(&node),
+            hopr_api::ChainKeypair::random(),
+            cfg(),
+        );
+        match result {
+            Err(StrategyError::InvalidConfiguration(message)) => assert!(message.contains("node key"), "{message}"),
+            other => panic!("expected a rejected node key, got {:?}", other.err()),
+        }
+
+        PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(node, BOB_KP.clone(), cfg())?;
+        Ok(())
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_new_deposit_address_dedup_skips_duplicate() -> anyhow::Result<()> {
         let da: Address = [0x42u8; 20].into();

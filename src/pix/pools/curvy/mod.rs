@@ -819,7 +819,8 @@ where
     /// funding source.
     ///
     /// Fails — rather than deferring to the first deposit — when the operator key is not set, the
-    /// state file cannot be opened, or an environment override does not parse.
+    /// state file cannot be opened, an environment override does not parse, or direct shielding is
+    /// given a key that is not the node's.
     pub fn new(
         node: Arc<N>,
         node_key: hopr_api::ChainKeypair,
@@ -854,6 +855,15 @@ where
         StrategyError::validate_config(&cfg)?;
         // After the overrides, so an env-selected mode is judged rather than the file's default.
         validate_mode_requirements(&cfg)?;
+        // The Safe module's `nodeOnly` check rejects any other signer, so a foreign key would pass
+        // startup and then make every direct shield revert. The portal path never signs with it.
+        if cfg.shielding == CurvyShielding::Direct && node_key.public().to_address() != node.identity().node_address {
+            return Err(StrategyError::InvalidConfiguration(format!(
+                "direct shielding signs with the node key, but the given key belongs to {} while the node is {}",
+                node_key.public().to_address(),
+                node.identity().node_address
+            )));
+        }
 
         // Portal deployment is self-signed even when proofs go through the relayer.
         let operator_key = if cfg.submission == CurvySubmission::Operator || cfg.shielding == CurvyShielding::Portal {
