@@ -89,6 +89,9 @@ const MAX_COMMITMENTS_PER_PROOF: usize = 5;
 const MAX_WITHDRAWAL_INPUTS: usize = 10;
 /// An aggregation spends one or two committed input notes.
 const MAX_ALLOCATION_INPUTS: usize = 2;
+/// How many times, and how far apart, to look for a confirmed direct shield's note.
+const DIRECT_SHIELD_OBSERVATIONS: usize = 3;
+const DIRECT_SHIELD_OBSERVATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// Search budget for an exact whole-note withdrawal; see `select_notes`.
 const MAX_NOTE_SELECTION_STEPS: usize = 1 << 16;
 /// Never evict an uncertain proof to make room: its private outputs may still be needed.
@@ -115,6 +118,9 @@ pub type PortalFunder = Arc<dyn Fn(Address, HoprBalance) -> BoxFuture<'static, R
 /// call, the gross amount to approve, and a check of whether the shield's note already exists —
 /// which the shielder consults before resubmitting after a nonce conflict, since an earlier copy
 /// of the same shield may be the transaction that took the nonce.
+///
+/// `Ok` means the transaction confirmed, not that the shield took effect: the Safe reports a
+/// failed inner call without reverting, so the caller verifies the note on chain.
 pub type DirectShielder = Arc<
     dyn Fn(Vec<u8>, Address, Address, Address, u128, ShieldLanded) -> BoxFuture<'static, Result<(), String>>
         + Send
@@ -1031,6 +1037,11 @@ where
                     ))
                 })?;
         }
+        let observed = if matches!(observed, 1 | 2) {
+            observed
+        } else {
+            self.observe_direct_shield(client, &prepared.note).await?
+        };
 
         {
             let mut state = self.state.lock();
@@ -1053,6 +1064,38 @@ where
             self.store.save(&state)?;
         }
         self.recover_pending().await
+    }
+
+    /// The note's status once a submitted direct shield has confirmed.
+    ///
+    /// A confirmed module call is not a shield: the Safe reports a failed inner call — an
+    /// allowance it lacks, a balance too small, the gate closed — through `safeExecution` rather
+    /// than by reverting, and Blokli's confirming submission returns only the hash. The aggregator
+    /// is asked instead, a few times, since the read may be served by a node a block behind.
+    ///
+    /// On failure the shield stays journalled as in flight and nothing is recorded as funding, so
+    /// the next attempt re-checks the chain before shielding again rather than trusting a phantom
+    /// note.
+    async fn observe_direct_shield(
+        &self,
+        client: &CurvyClient,
+        note: &OwnedNote,
+    ) -> Result<u8, RsSdkCurvyAdapterError> {
+        for attempt in 0..DIRECT_SHIELD_OBSERVATIONS {
+            let status = client.note_status(&note.note_id()).await?;
+            if matches!(status, 1 | 2) {
+                return Ok(status);
+            }
+            if attempt + 1 < DIRECT_SHIELD_OBSERVATIONS {
+                tokio::time::sleep(DIRECT_SHIELD_OBSERVATION_INTERVAL).await;
+            }
+        }
+        Err(RsSdkCurvyAdapterError::Funding(
+            "the direct shield transaction confirmed, but the Curvy aggregator does not know its note: the Safe's \
+             inner call failed. Check the Safe's wxHOPR balance, that it may call the aggregator \
+             (`scripts/scope-curvy-aggregator.sh`), and that the deployment has `directShieldEnabled` set."
+                .to_owned(),
+        ))
     }
 
     /// Shields initial private-pool funding if no durable funding already exists.
@@ -2361,6 +2404,78 @@ mod tests {
                 .is_ok()
         );
         Ok(adapter)
+    }
+
+    /// A Safe reports a failed inner call without reverting, so a confirmed direct shield proves
+    /// nothing by itself. Only the aggregator knowing the note does.
+    #[tokio::test]
+    async fn a_confirmed_direct_shield_counts_only_once_its_note_is_on_chain() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        for inner_call_succeeds in [false, true] {
+            let state = RedbCurvyDepositState::in_memory()?;
+            // Resume a journalled shield, so the test needs no fee quote to prepare one.
+            let note = Adapter::owned_note(&fixture(7))?;
+            let store = RedbCurvySdkStore::new(&state)?;
+            let mut persisted = store.load()?;
+            persisted.direct_shield_in_flight = Some(StoredDirectShield {
+                note: StoredNote::from(&note),
+                gross: "7".to_owned(),
+            });
+            store.save(&persisted)?;
+
+            let landed = Arc::new(AtomicBool::new(false));
+            let submissions = Arc::new(AtomicUsize::new(0));
+            let server = relayer::http_tests::Server::new({
+                let landed = landed.clone();
+                move |path, body| {
+                    assert_eq!(path, "/graphql");
+                    assert!(body["query"].as_str().unwrap().contains("curvyNoteStatus"));
+                    Some(note_status_response(landed.load(Ordering::SeqCst)))
+                }
+            })
+            .await;
+            let shielder: DirectShielder = {
+                let landed = landed.clone();
+                let submissions = submissions.clone();
+                Arc::new(move |_, _, _, _, _, _| {
+                    submissions.fetch_add(1, Ordering::SeqCst);
+                    // The transaction confirms either way; only the inner call differs.
+                    landed.store(inner_call_succeeds, Ordering::SeqCst);
+                    Box::pin(async { Ok(()) })
+                })
+            };
+            let adapter = test_adapter_with_shielder(&state, server.url.clone(), Some(shielder))?;
+            let safe = Address::from([9_u8; 20]);
+
+            if inner_call_succeeds {
+                adapter.ensure_funded(HoprBalance::from(U256::from(7_u8)), safe).await?;
+                adapter.ensure_funded(HoprBalance::from(U256::from(7_u8)), safe).await?;
+                let stored = store.load()?;
+                assert_eq!(stored.funding, vec![StoredNote::from(&note)]);
+                assert!(stored.direct_shield_in_flight.is_none());
+                assert_eq!(submissions.load(Ordering::SeqCst), 1, "funded once, then left alone");
+            } else {
+                for attempt in 1..=2 {
+                    let error = adapter
+                        .ensure_funded(HoprBalance::from(U256::from(7_u8)), safe)
+                        .await
+                        .unwrap_err();
+                    assert!(matches!(error, RsSdkCurvyAdapterError::Funding(_)), "{error}");
+                    assert_eq!(
+                        submissions.load(Ordering::SeqCst),
+                        attempt,
+                        "a failed shield is retried"
+                    );
+                }
+                let stored = store.load()?;
+                assert!(stored.funding.is_empty(), "no phantom funding note");
+                assert!(
+                    stored.direct_shield_in_flight.is_some(),
+                    "still journalled for the next attempt"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]
