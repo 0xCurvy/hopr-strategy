@@ -118,6 +118,25 @@ impl PaymasterInfo {
     /// Erring high on purpose. The relayer rejects an aggregation whose fee note is below its
     /// floor *before* queueing it, so an under-priced note costs a whole round trip and a
     /// re-proof; the excess is the operator's, not lost.
+    ///
+    /// ```
+    /// # use hopr_strategy::pix::pools::curvy::relayer::{CurvyPublicKeys, PaymasterInfo};
+    /// let quote = PaymasterInfo {
+    ///     operator: CurvyPublicKeys {
+    ///         spend_public_key: "1.2".into(),
+    ///         view_public_key: "3.4".into(),
+    ///         bjj_public_key: "5.6".into(),
+    ///     },
+    ///     accepted_vault_token_ids: None,
+    ///     submit_aggregation_gas_units: "100000".into(),
+    ///     gas_price_wei: "2".into(),
+    ///     client_buffer_bps: 1_000,
+    ///     relayer_tolerance_bps: 500,
+    /// };
+    /// // 100 000 gas at 2 wei, plus the operator's 10% client buffer.
+    /// assert_eq!(quote.required_fee()?, 220_000);
+    /// # Ok::<(), hopr_strategy::errors::StrategyError>(())
+    /// ```
     pub fn required_fee(&self) -> Result<u128, StrategyError> {
         let units: u128 = self.submit_aggregation_gas_units.parse().map_err(|error| {
             StrategyError::other(anyhow::anyhow!("relayer quoted an unparseable gas unit count: {error}"))
@@ -269,6 +288,16 @@ pub fn fee_note_valuations(
 
 /// `parseUsdPrice`: a decimal USD price string scaled to [`PRICE_DECIMALS`] places, extra
 /// places truncated, the way the relayer parses the same string.
+///
+/// ```
+/// # use hopr_strategy::pix::pools::curvy::relayer::parse_usd_price;
+/// # use hopr_api::types::primitive::prelude::U256;
+/// assert_eq!(parse_usd_price("0.05")?, U256::from(5_000_000_u64));
+/// // Places beyond the eighth are truncated, not rounded.
+/// assert_eq!(parse_usd_price("1.234567899")?, U256::from(123_456_789_u64));
+/// assert!(parse_usd_price("0").is_err());
+/// # Ok::<(), hopr_strategy::errors::StrategyError>(())
+/// ```
 pub fn parse_usd_price(price: &str) -> Result<U256, StrategyError> {
     let trimmed = price.trim();
     let (whole, fraction) = trimmed.split_once('.').unwrap_or((trimmed, ""));
@@ -295,6 +324,30 @@ pub fn parse_usd_price(price: &str) -> Result<U256, StrategyError> {
 }
 
 /// `convertTokenAmount`: `amount` of `from` in units of `to`, rounded up.
+///
+/// ```
+/// # use hopr_strategy::pix::pools::curvy::relayer::{TokenValuation, convert_token_amount, parse_usd_price};
+/// let xdai = TokenValuation {
+///     usd: parse_usd_price("1")?,
+///     decimals: 18,
+/// };
+/// let wxhopr = TokenValuation {
+///     usd: parse_usd_price("0.05")?,
+///     decimals: 18,
+/// };
+/// // One xDai buys twenty wxHOPR.
+/// assert_eq!(
+///     convert_token_amount(10_u128.pow(18), &xdai, &wxhopr)?,
+///     20 * 10_u128.pow(18)
+/// );
+/// // A fraction of a base unit rounds up, so a fee note never falls short of the gate.
+/// let pricier = TokenValuation {
+///     usd: parse_usd_price("3")?,
+///     decimals: 18,
+/// };
+/// assert_eq!(convert_token_amount(1, &xdai, &pricier)?, 1);
+/// # Ok::<(), hopr_strategy::errors::StrategyError>(())
+/// ```
 pub fn convert_token_amount(amount: u128, from: &TokenValuation, to: &TokenValuation) -> Result<u128, StrategyError> {
     if from.usd.is_zero() || to.usd.is_zero() {
         return Err(StrategyError::other(anyhow::anyhow!("token prices must be positive")));
@@ -407,6 +460,19 @@ impl RelayClient {
     ///
     /// A `404` means the deployment runs no paymaster and accepts aggregations without a fee
     /// note; that is reported as `Ok(None)` rather than an error.
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # use hopr_strategy::pix::pools::curvy::relayer::RelayClient;
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let relay = RelayClient::new("https://api.curvy.box".parse()?, Duration::from_secs(10))?;
+    /// match relay.paymaster(100).await? {
+    ///     Some(quote) => println!("fee note of {} wei", quote.required_fee()?),
+    ///     None => println!("this deployment takes aggregations without a fee note"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn paymaster(&self, chain_id: u64) -> Result<Option<PaymasterInfo>, RelayError> {
         let url = self.endpoint(&format!("/relay/paymaster?chainId={chain_id}"))?;
         let response = self
@@ -529,6 +595,18 @@ impl RelayClient {
     }
 
     /// Polls until the submission is on chain, fails, or `deadline` passes.
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # use hopr_strategy::pix::pools::curvy::relayer::RelayClient;
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let relay = RelayClient::new("https://api.curvy.box".parse()?, Duration::from_secs(10))?;
+    /// let submitted = relay.status("request-id-from-submit").await?;
+    /// let landed = relay.await_inclusion(submitted, Duration::from_secs(120)).await?;
+    /// assert!(landed.status.is_on_chain());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn await_inclusion(
         &self,
         submission: RelaySubmission,

@@ -261,6 +261,22 @@ fn session_note_range(id: &PixAddressId) -> ([u8; OWNED_NOTE_KEY_SIZE], [u8; OWN
 
 /// Storage used by the Curvy pool for crash-safe query resumption, note correlation and scan
 /// secrets.
+///
+/// ```
+/// # use hopr_strategy::pix::pools::curvy::{CurvyDepositState, CurvyEventKind, RedbCurvyDepositState};
+/// fn resume_from(state: &impl CurvyDepositState) -> anyhow::Result<()> {
+///     // `None` until the first page of notes has been recorded: scanning starts from genesis.
+///     match state.cursor(CurvyEventKind::Committed)? {
+///         Some(cursor) => println!("resuming committed notes after {cursor:?}"),
+///         None => println!("scanning committed notes from the start"),
+///     }
+///     Ok(())
+/// }
+///
+/// let dir = tempfile::tempdir()?;
+/// resume_from(&RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub trait CurvyDepositState: Send + Sync + 'static {
     fn cursor(&self, kind: CurvyEventKind) -> Result<Option<CurvyEventCursor>, CurvyStateError>;
 
@@ -321,6 +337,22 @@ impl RedbCurvyDepositState {
     ///
     /// The path must be reused across restarts; an ephemeral path loses the private note state
     /// that makes committed deposits sweepable.
+    ///
+    /// ```
+    /// # use hopr_strategy::pix::pools::curvy::{CurvyDepositState, CurvyEventKind, RedbCurvyDepositState};
+    /// let dir = tempfile::tempdir()?;
+    /// // In a node, a path derived from its identity, so a restart reopens the same file.
+    /// let path = dir
+    ///     .path()
+    ///     .join("curvy-pix-0x0000000000000000000000000000000000000001.redb");
+    /// let state = RedbCurvyDepositState::open(&path)?;
+    /// assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
+    /// drop(state);
+    /// // Reopening finds the same store rather than a fresh one.
+    /// let state = RedbCurvyDepositState::open(&path)?;
+    /// assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CurvyStateError> {
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
