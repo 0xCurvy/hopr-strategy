@@ -1241,6 +1241,10 @@ fn is_transient_chain_read(message: &str) -> bool {
         || message.contains("HTTP error 429")
         || message.contains("HTTP error 5")
         || message.contains("the Curvy relayer rate limited the request:")
+        // `RelayError::Transport`: a gateway 5xx, a 408, a refused connection or an unreadable
+        // answer. A relayed submission is journalled before it is sent, so waiting one out and
+        // retrying reconciles the earlier attempt instead of duplicating it.
+        || message.contains("the Curvy relayer is unreachable:")
         // The gate re-priced gas between the quote and the proof; the next attempt re-quotes.
         || message.contains("operator note does not cover the gas cost")
         // A truncated or reset response from the gateway or the indexer, on the way to a read.

@@ -1171,6 +1171,27 @@ async fn a_tree_that_never_catches_up_fails_within_the_tracking_budget() -> anyh
     Ok(())
 }
 
+#[tokio::test]
+async fn a_relayer_gateway_error_is_waited_out() -> anyhow::Result<()> {
+    use super::{
+        relayer::{RelayClient, http_tests::Server},
+        sdk::RsSdkCurvyAdapterError,
+    };
+
+    // Through the real HTTP decoding boundary, so the classifier is checked against the text
+    // the relayer client actually produces rather than a hand-written approximation.
+    let server = Server::new(|_, _| Some((502, serde_json::json!({"error": "Bad Gateway"})))).await;
+    let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+    let error = RsSdkCurvyAdapterError::from(client.paymaster(100).await.unwrap_err());
+    assert!(super::is_retryable_lag(&error.to_string()), "{error}");
+
+    // Nothing listening at all is the same outage seen from the socket.
+    let unreachable = RelayClient::new("http://127.0.0.1:1/".parse()?, Duration::from_secs(2))?;
+    let error = RsSdkCurvyAdapterError::from(unreachable.paymaster(100).await.unwrap_err());
+    assert!(super::is_retryable_lag(&error.to_string()), "{error}");
+    Ok(())
+}
+
 #[test]
 fn tree_lag_is_recognised_and_polled_at_a_tenth_of_the_budget() {
     use super::{relayer::RelayError, sdk::RsSdkCurvyAdapterError};
