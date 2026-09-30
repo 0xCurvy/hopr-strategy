@@ -32,7 +32,7 @@
 //!
 //! | | default | alternative |
 //! |---|---|---|
-//! | [`CurvyDepositPoolConfig::shielding`] | `direct` — the Safe calls `directShield`, no portal | `portal` — fund a deterministic entry portal, then deploy and shield it |
+//! | [`CurvyDepositPoolConfig::shielding`] | `direct` — the Safe shields through the shield router, no portal | `portal` — fund a deterministic entry portal, then deploy and shield it |
 //! | [`CurvyDepositPoolConfig::submission`] | `relayer` — hand proofs to Curvy's off-chain relayer | `operator` — sign and submit them here |
 //! | [`CurvyDepositPoolConfig::note_source`] | `blokli` — notes from Blokli's own Curvy index | `curvy_indexer` — notes from Curvy's shared indexer (`/sync`), see [`indexer`] |
 //!
