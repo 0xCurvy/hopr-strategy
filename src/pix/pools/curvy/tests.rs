@@ -76,7 +76,11 @@ fn position(block: u64) -> CurvyEventPosition {
 
 /// A scan secret from explicit Curvy private keys, in the hopr-types shape.
 fn scan_secret(spend_private_key: &str, view_private_key: &str) -> anyhow::Result<CurvyScanSecret> {
-    let (spend_meta_key, _) = stealth::get_meta(spend_private_key, view_private_key)?;
+    // `get_meta` takes each key as exactly 32 bytes of hex.
+    let (spend_meta_key, _) = stealth::get_meta(
+        &format!("{spend_private_key:0>64}"),
+        &format!("{view_private_key:0>64}"),
+    )?;
     let v_bytes = const_hex::decode(view_private_key)?;
     let mut v = [0u8; 32];
     v[32 - v_bytes.len()..].copy_from_slice(&v_bytes);
