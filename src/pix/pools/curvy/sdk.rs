@@ -919,11 +919,11 @@ where
         let store = RedbCurvySdkStore::new(state)?;
         let mut persisted = store.load()?;
         let spender = match &persisted.spender {
-            Some(spender) => Account::from_meta_keys(&full_width_spend_key(&spender.k), &spender.v)?,
+            Some(spender) => Account::from_meta_keys(&full_width_key(&spender.k), &full_width_key(&spender.v))?,
             None => {
                 let (k, v, ..) =
                     stealth::new_meta().map_err(|error| RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("{error}")))?;
-                let k = full_width_spend_key(&k);
+                let (k, v) = (full_width_key(&k), full_width_key(&v));
                 let spender = Account::from_meta_keys(&k, &v)?;
                 persisted.spender = Some(StoredSpender { k, v });
                 store.save(&persisted)?;
@@ -2572,14 +2572,15 @@ fn exact_note_subset(values: &[u128], target: u128, budget: usize) -> Option<Vec
     search(values, &suffix, 0, target, &mut steps, &mut picked).then_some(picked)
 }
 
-/// Left-pads a spend private key to the 64 hex digits the SDK requires.
+/// Left-pads a stealth private key to the 64 hex digits the SDK requires.
 ///
-/// `stealth::new_meta` prints the scalar without leading zero bytes, so roughly one key in 256
-/// comes out shorter than 32 bytes, and `Account::from_meta_keys` parses the spend key as exactly
-/// 32 — a fresh node then failed to start depending on its random draw. The padding changes the
+/// `stealth::new_meta` used to print a scalar without its leading zero bytes, so roughly one spend key
+/// in 256 and one view key in 48 came out shorter than 32 bytes, and nodes have persisted such keys.
+/// `Account::from_meta_keys` parses the spend key as exactly 32 bytes, and from `curvy-core` 0.1.1 on the
+/// view key as well — a node then fails to start depending on its random draw. The padding changes the
 /// encoding only: the scalar, and so every key derived from it, is the same.
-fn full_width_spend_key(k: &str) -> String {
-    format!("{k:0>64}")
+fn full_width_key(key: &str) -> String {
+    format!("{key:0>64}")
 }
 
 fn note_id(note: &OwnedNote) -> String {
@@ -2594,14 +2595,20 @@ fn note_id(note: &OwnedNote) -> String {
 #[cfg(test)]
 mod tests {
     use curvy_core::{field::Fr, witness::Note};
-    use hopr_api::types::{
-        crypto::prelude::{BjjKeypair, Keypair},
-        crypto_random::Randomizable,
-        internal::prelude::HoprPseudonym,
+    use hopr_api::{
+        ChainKeypair,
+        types::{
+            crypto::prelude::{BjjKeypair, Bn254Keypair, Keypair},
+            crypto_random::Randomizable,
+            internal::prelude::HoprPseudonym,
+        },
     };
 
     use super::*;
-    use crate::pix::pools::curvy::{OwnedCurvyDeposit, detect::public_key_from_dec};
+    use crate::pix::pools::curvy::{
+        OwnedCurvyDeposit,
+        detect::{public_key_from_dec, spend_meta_key_dec, view_key_dec},
+    };
 
     type Adapter = RsSdkCurvyAdapter<blokli_client::BlokliClient>;
 
@@ -4636,7 +4643,8 @@ mod tests {
     /// A valid compressed scan identity, derived from real Curvy meta-keys because the
     /// type rejects byte strings that are not curve points.
     fn scan_key(spend_private_key: &str, view_private_key: &str) -> anyhow::Result<CurvyScanPublicKey> {
-        let (spend_meta_key, _) = stealth::get_meta(spend_private_key, view_private_key)?;
+        let (spend_meta_key, _) =
+            stealth::get_meta(&full_width_key(spend_private_key), &full_width_key(view_private_key))?;
         let mut v = [0u8; 32];
         let v_bytes = const_hex::decode(view_private_key)?;
         v[32 - v_bytes.len()..].copy_from_slice(&v_bytes);
@@ -4669,24 +4677,59 @@ mod tests {
     fn recipient_decompresses_both_halves_of_the_scan_identity() -> anyhow::Result<()> {
         let committed = fixture(7);
         let key = scan_key("07", "0b")?;
-        let (big_k, big_v) = stealth::get_meta("07", "0b")?;
+        let (big_k, big_v) = stealth::get_meta(&full_width_key("07"), &full_width_key("0b"))?;
         let recipient = StoredAllocation::recipient(&committed.deposit.address, key)?;
         assert_eq!(recipient.viewer.big_k, big_k);
         assert_eq!(recipient.viewer.big_v, big_v);
         Ok(())
     }
 
+    /// The public keys `(K, V)` of the 31-byte scalars `01…01` and `02…02`, derived by HOPR's own
+    /// key types rather than through Curvy's hex parsing.
+    fn short_key_identity() -> anyhow::Result<(String, String)> {
+        let (mut k, mut v) = ([1u8; 32], [2u8; 32]);
+        (k[0], v[0]) = (0, 0);
+        Ok((
+            spend_meta_key_dec(ChainKeypair::from_secret(&k)?.public()),
+            view_key_dec(Bn254Keypair::from_secret_be(&v)?.public()).map_err(anyhow::Error::msg)?,
+        ))
+    }
+
     #[test]
-    fn a_short_spend_key_is_padded_to_the_width_the_sdk_parses() -> anyhow::Result<()> {
-        // A valid scalar whose top byte is zero, as `new_meta` prints one: 31 bytes.
-        let short = "01".repeat(31);
-        let view = "02".repeat(32);
-        assert!(Account::from_meta_keys(&short, &view).is_err());
-        let padded = full_width_spend_key(&short);
-        assert_eq!(padded, format!("00{short}"));
-        let account = Account::from_meta_keys(&padded, &view)?;
-        assert_eq!(account.big_k, stealth::get_meta(&short, &view)?.0);
-        assert_eq!(full_width_spend_key(&padded), padded);
+    fn short_keys_are_padded_to_the_width_the_sdk_parses() -> anyhow::Result<()> {
+        // Valid scalars whose top byte is zero, as `new_meta` used to print them: 31 bytes.
+        let (short_spend, short_view) = ("01".repeat(31), "02".repeat(31));
+        assert!(Account::from_meta_keys(&short_spend, &"02".repeat(32)).is_err());
+        let (k, v) = (full_width_key(&short_spend), full_width_key(&short_view));
+        assert_eq!(k, format!("00{short_spend}"));
+        assert_eq!(v, format!("00{short_view}"));
+        let account = Account::from_meta_keys(&k, &v)?;
+        let (big_k, big_v) = short_key_identity()?;
+        assert_eq!(account.big_k, big_k);
+        assert_eq!(account.big_v, big_v);
+        assert_eq!(full_width_key(&k), k);
+        Ok(())
+    }
+
+    /// A node that persisted its identity while `new_meta` still printed short keys must keep
+    /// starting: `curvy-core` 0.1.1 rejects a short view key where earlier releases accepted one.
+    #[tokio::test]
+    async fn a_persisted_short_spender_identity_still_loads() -> anyhow::Result<()> {
+        let server =
+            relayer::http_tests::Server::new(|_, _| panic!("loading an identity makes no HTTP requests")).await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let store = RedbCurvySdkStore::new(&state)?;
+        let mut persisted = store.load()?;
+        persisted.spender = Some(StoredSpender {
+            k: "01".repeat(31),
+            v: "02".repeat(31),
+        });
+        store.save(&persisted)?;
+
+        let adapter = test_adapter(&state, server.url.clone())?;
+        let (big_k, big_v) = short_key_identity()?;
+        assert_eq!(adapter.spender.big_k, big_k);
+        assert_eq!(adapter.spender.big_v, big_v);
         Ok(())
     }
 

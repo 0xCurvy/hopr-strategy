@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn secp256k1_meta_key_round_trips_through_curvy_decimal_form() -> anyhow::Result<()> {
-        let (big_k, _) = stealth::get_meta("01", "02")?;
+        let (big_k, _) = stealth::get_meta(&"01".repeat(32), &"02".repeat(32))?;
         let key = public_key_from_dec(&big_k).map_err(anyhow::Error::msg)?;
         assert_eq!(spend_meta_key_dec(&key), big_k);
         Ok(())
@@ -333,10 +333,8 @@ mod tests {
 
     #[test]
     fn bn254_view_key_round_trips_through_curvy_decimal_form() -> anyhow::Result<()> {
-        let (_, big_v) = stealth::get_meta("01", "02")?;
-        let mut v = [0u8; 32];
-        v[31] = 2;
-        let view = Bn254Keypair::from_secret_be(&v)?;
+        let (_, big_v) = stealth::get_meta(&"01".repeat(32), &"02".repeat(32))?;
+        let view = Bn254Keypair::from_secret_be(&[2u8; 32])?;
         assert_eq!(view_key_dec(view.public()).map_err(anyhow::Error::msg)?, big_v);
         Ok(())
     }
