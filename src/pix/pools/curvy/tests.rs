@@ -28,7 +28,7 @@ use curvy_core::{
 };
 use hopr_api::{
     ChainKeypair,
-    chain::DepositPool,
+    chain::{DepositPool, PoolTransferSource},
     node::{HasChainApi, PixAddressId, PixDepositData},
     types::{
         crypto::prelude::{BjjKeypair, BjjPublicKey, Bn254Keypair, CurvyScanPublicKey, CurvyScanSecret, Keypair},
@@ -690,6 +690,8 @@ impl CurvyIndexSource for ScriptedIndex {
 struct RecordingAdapter {
     funded: parking_lot::Mutex<Vec<(HoprBalance, Address)>>,
     funding_finality_failures: parking_lot::Mutex<usize>,
+    /// What `fund` has added, which is what `available_balance` reports.
+    available: parking_lot::Mutex<HoprBalance>,
     /// How many upcoming `allocate` calls answer "not in the committed tree yet".
     tree_lag_failures: parking_lot::Mutex<usize>,
     /// Every `allocate` call, successful or not.
@@ -729,7 +731,7 @@ const INDEX_LAG: &str = "Curvy SDK operation failed: sync: index did not reconci
 impl CurvySdkAdapter for RecordingAdapter {
     type Error = ScriptedFailure;
 
-    async fn ensure_funded(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error> {
+    async fn fund(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error> {
         self.funded.lock().push((gross, recovery_address));
         let mut waiting = self.funding_finality_failures.lock();
         if *waiting > 0 {
@@ -738,7 +740,12 @@ impl CurvySdkAdapter for RecordingAdapter {
                 super::sdk::RsSdkCurvyAdapterError::RelayFinalityPending.to_string(),
             ));
         }
+        *self.available.lock() += gross;
         Ok(())
+    }
+
+    async fn available_balance(&self) -> Result<HoprBalance, Self::Error> {
+        Ok(*self.available.lock())
     }
 
     async fn allocate(
@@ -1000,7 +1007,6 @@ async fn harness(adapter: RecordingAdapter, tracking_time: Duration) -> anyhow::
     let pool = CurvyDepositPool::with_parts(
         node,
         cfg,
-        HoprBalance::new_base(100),
         ScriptedIndex::default(),
         adapter,
         RsCoreCurvyNoteDetector::for_token(4),
@@ -1030,14 +1036,19 @@ async fn pool_round_trip_generate_deposit_notify_and_sweep() -> anyhow::Result<(
     assert_eq!(&stored.public(), data.scan_key());
     assert_eq!(pool.generate_deposit_data(&id).await?, data);
 
-    // Entry: the first deposit shields the float from the Safe (the portal's recovery address is
-    // the node's Safe, whatever the node says it is), then allocates.
-    pool.deposit_funds_to(&id, &address, ten(), data.clone()).await?;
+    // Entry: whoever decides to fund shields the float from the Safe (the portal's recovery
+    // address is the node's Safe, whatever the node says it is); a deposit then allocates from
+    // that funding and shields nothing itself.
+    assert!(pool.available_balance().await?.is_zero());
+    pool.fund(HoprBalance::new_base(100)).await?;
     let safe = pool.node.identity().safe_address;
     assert_eq!(
         harness.adapter.funded.lock().as_slice(),
         &[(HoprBalance::new_base(100), safe)]
     );
+    assert_eq!(pool.available_balance().await?, HoprBalance::new_base(100));
+    pool.deposit_funds_to(&id, &address, ten(), data.clone()).await?;
+    assert_eq!(harness.adapter.funded.lock().len(), 1, "a deposit does not shield");
     assert_eq!(
         harness.adapter.allocations.lock().as_slice(),
         &[(id, address, *data.scan_key(), ten())]
@@ -1211,7 +1222,10 @@ async fn a_batch_is_one_allocation_call() -> anyhow::Result<()> {
     assert!(matches!(outcomes[1], Ok((id, ())) if id == second));
     assert!(outcomes[2].is_err());
     assert_eq!(harness.adapter.allocations.lock().len(), 2);
-    assert_eq!(harness.adapter.funded.lock().len(), 1);
+    assert!(
+        harness.adapter.funded.lock().is_empty(),
+        "a transfer from the funding never shields"
+    );
     Ok(())
 }
 
@@ -1274,15 +1288,16 @@ async fn state_from_the_same_chain_is_kept() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn pool_transfer_is_not_supported() -> anyhow::Result<()> {
+async fn pool_transfer_from_a_deposit_is_not_supported() -> anyhow::Result<()> {
     let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
     let dst_id = pix_id(2);
     let data = harness.pool.generate_deposit_data(&dst_id).await?;
+    let src_id = pix_id(1);
+    let key = BjjKeypair::random();
     let result = harness
         .pool
         .pool_transfer(
-            &pix_id(1),
-            &BjjKeypair::random(),
+            PoolTransferSource::Deposit { id: &src_id, key: &key },
             &dst_id,
             *BjjKeypair::random().public(),
             data,
@@ -1290,6 +1305,38 @@ async fn pool_transfer_is_not_supported() -> anyhow::Result<()> {
         )
         .await;
     assert!(result.is_err());
+    assert!(harness.adapter.allocations.lock().is_empty());
+    Ok(())
+}
+
+/// A transfer from the funding is an allocation of the given amount; without one it is refused,
+/// since an allocation is paid from one note plus fees and "all of it" is not such an amount.
+#[tokio::test]
+async fn pool_transfer_from_the_funding_allocates() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    let pool = &harness.pool;
+    pool.fund(HoprBalance::new_base(30)).await?;
+    let dst_id = pix_id(2);
+    let dst = *BjjKeypair::random().public();
+    let data = pool.generate_deposit_data(&dst_id).await?;
+
+    pool.pool_transfer(PoolTransferSource::Funding, &dst_id, dst, data.clone(), Some(ten()))
+        .await?;
+    let refused = pool
+        .pool_transfer(PoolTransferSource::Funding, &dst_id, dst, data.clone(), None)
+        .await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("needs an amount")),
+        "{refused:?}"
+    );
+
+    assert_eq!(
+        harness.adapter.allocations.lock().as_slice(),
+        &[(dst_id, dst, *data.scan_key(), ten())]
+    );
+    assert_eq!(harness.adapter.funded.lock().len(), 1);
     Ok(())
 }
 
@@ -1297,16 +1344,26 @@ async fn pool_transfer_is_not_supported() -> anyhow::Result<()> {
 // Mode configuration
 // ---------------------------------------------------------------------------
 
+/// Funding waits out a pending finality within the pool's own budget, as a deposit does, rather
+/// than handing the lag to whoever funds. A deposit never funds.
 #[test_log::test(tokio::test)]
-async fn a_deposit_waits_for_finality_before_funding() -> anyhow::Result<()> {
+async fn funding_waits_out_a_pending_finality() -> anyhow::Result<()> {
     let adapter = RecordingAdapter::consistent();
     *adapter.funding_finality_failures.lock() = 2;
     let harness = harness(adapter, Duration::from_secs(2)).await?;
     let id = pix_id(1);
     let owner = BjjKeypair::random();
     let data = harness.pool.generate_deposit_data(&id).await?;
+
+    harness.pool.fund(ten()).await?;
+    assert_eq!(
+        harness.adapter.funded.lock().len(),
+        3,
+        "two lagging attempts, then funded"
+    );
+
     harness.pool.deposit_funds_to(&id, owner.public(), ten(), data).await?;
-    assert_eq!(harness.adapter.funded.lock().len(), 3);
+    assert_eq!(harness.adapter.funded.lock().len(), 3, "the deposit did not fund");
     assert_eq!(*harness.adapter.allocate_attempts.lock(), 1);
     assert_eq!(harness.adapter.allocations.lock().len(), 1);
     Ok(())
@@ -1647,7 +1704,6 @@ async fn replay_pool_watch_against_staging() -> anyhow::Result<()> {
     let pool = CurvyDepositPool::with_parts(
         node,
         cfg,
-        HoprBalance::new_base(100),
         CurvyIndexerSource(CurvyIndexerClient::new(api, Arc::new(100u64))),
         RecordingAdapter::consistent(),
         RsCoreCurvyNoteDetector::for_token(2),
@@ -1763,7 +1819,6 @@ async fn staging_watcher_catches_up_on_gnosis() -> anyhow::Result<()> {
     let pool = CurvyDepositPool::with_parts(
         node,
         cfg,
-        HoprBalance::new_base(100),
         CurvyIndexerSource(CurvyIndexerClient::new(api, Arc::new(100u64))),
         RecordingAdapter::consistent(),
         RsCoreCurvyNoteDetector::for_token(2),
