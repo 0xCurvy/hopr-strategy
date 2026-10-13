@@ -4100,7 +4100,7 @@ dependencies = [
 [[package]]
 name = "hopr-api"
 version = "4.4.1"
-source = "git+https://github.com/0xCurvy/hopr-api.git?branch=lazar%2Fshield-router#9b321e35ead97ccc241ebfef7ba0848620d5327c"
+source = "git+https://github.com/0xCurvy/hopr-api.git?branch=lazar%2Fpool-funding#3a755ebd4cfbf7ad4c218c08a13ee758ba18cfdc"
 dependencies = [
  "async-trait",
  "atomic_enum",
