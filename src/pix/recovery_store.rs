@@ -102,7 +102,7 @@ use hopr_api::{
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use scrypt::{Params as ScryptParams, scrypt};
 
-use super::private_db::{PrivateDatabaseError, open_private_database};
+use super::store::private_db::{PrivateDatabaseError, open_private_database};
 
 // Key = pseudonym (10 bytes) + ssa_index (4 bytes), which is exactly the
 // `PixAddressId` byte representation.
@@ -322,9 +322,9 @@ impl PixRecoveryStore {
     /// writes one and adopts the password in use at that point.
     ///
     /// Any missing parent directories of `path` are created. The database file itself is kept
-    /// at mode `0600` on Unix, so the ciphertext and password verifier are not exposed to other
-    /// local users, and to the offline scrypt search an exposed verifier would allow, by the
-    /// process umask.
+    /// at mode `0600` on Unix instead of the mode the process umask would yield, so the
+    /// ciphertext and password verifier are not exposed to other local users, or to the
+    /// offline scrypt search an exposed verifier would allow.
     ///
     /// # Examples
     ///

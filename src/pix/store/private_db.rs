@@ -58,10 +58,15 @@ mod tests {
         }
         // Changing umask in this process would race the other tests.
         let dir = tempfile::tempdir()?;
+        // The test's own path, minus the crate name the filter does not take: moving this module
+        // then cannot leave the child running no test at all and the parent passing on its word.
+        let (_, this_test) = concat!(module_path!(), "::database_is_private")
+            .split_once("::")
+            .expect("test module path has a crate prefix");
         let status = Command::new("sh")
             .args(["-c", "umask 022; exec \"$@\"", "pix-private-db-permissions"])
             .arg(std::env::current_exe()?)
-            .args(["--exact", "pix::private_db::tests::database_is_private"])
+            .args(["--exact", this_test])
             .env(CHILD_PATH, dir.path().join("private.redb"))
             .status()?;
         assert!(status.success());

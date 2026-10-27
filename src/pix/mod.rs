@@ -92,8 +92,8 @@
 //! [`PixStrategy::build_with_pool`](strategy::PixStrategy::build_with_pool).
 
 pub mod pools;
-mod private_db;
 pub mod recovery_store;
+mod store;
 pub mod strategy;
 
 use hopr_api::node::{PixAddressId, PixDepositData};

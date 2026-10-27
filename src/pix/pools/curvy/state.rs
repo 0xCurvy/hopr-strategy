@@ -35,7 +35,7 @@ use hopr_api::{
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use super::{CommittedCurvyNote, DetectedCurvyNote, OwnedCurvyDeposit, detect::parse_curvy_note_id};
-use crate::pix::private_db::open_private_database;
+use crate::pix::store::private_db::open_private_database;
 
 const CURSOR_TABLE: TableDefinition<u8, Vec<u8>> = TableDefinition::new("curvy_pix_cursor");
 const NOTE_ID_SIZE: usize = 32;
