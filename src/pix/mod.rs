@@ -92,6 +92,7 @@
 //! [`PixStrategy::build_with_pool`](strategy::PixStrategy::build_with_pool).
 
 pub mod pools;
+mod private_db;
 pub mod recovery_store;
 pub mod strategy;
 
