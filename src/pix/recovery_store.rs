@@ -310,7 +310,10 @@ impl PixRecoveryStore {
     /// A database created before the verifier existed has no verifier record; the first open
     /// writes one and adopts the password in use at that point.
     ///
-    /// Any missing parent directories of `path` are created.
+    /// Any missing parent directories of `path` are created. On Unix the database file is
+    /// created with mode `0600`, and an existing file is brought back to it, so the ciphertext
+    /// and password verifier are not exposed to other local users (and to the offline scrypt
+    /// search that an exposed verifier would allow) by the process umask.
     ///
     /// # Examples
     ///
@@ -335,7 +338,21 @@ impl PixRecoveryStore {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let db = Database::create(path.as_ref())?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path.as_ref())?;
+        // Set permissions on the same handle redb will use, including on an existing file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        let db = Database::builder().create_file(file)?;
 
         // Initialize or read the per-database scrypt salt, and ensure the key table exists.
         let salt: [u8; 16] = {
@@ -565,6 +582,36 @@ impl PixRecoveryStore {
             );
         }
         Ok(results)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permission_tests {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+
+    use super::*;
+
+    #[test]
+    fn database_is_private() -> anyhow::Result<()> {
+        const CHILD_PATH: &str = "PIX_RECOVERY_PERMISSION_TEST_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            drop(PixRecoveryStore::open(&path, "pw")?);
+            assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+            drop(PixRecoveryStore::open(&path, "pw")?);
+            assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+            return Ok(());
+        }
+        // Changing umask in this process would race the other tests.
+        let dir = tempfile::tempdir()?;
+        let status = Command::new("sh")
+            .args(["-c", "umask 022; exec \"$@\"", "pix-recovery-permissions"])
+            .arg(std::env::current_exe()?)
+            .args(["--exact", "pix::recovery_store::permission_tests::database_is_private"])
+            .env(CHILD_PATH, dir.path().join("pix_recovery.db"))
+            .status()?;
+        assert!(status.success());
+        Ok(())
     }
 }
 
