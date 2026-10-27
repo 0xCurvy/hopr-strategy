@@ -20,10 +20,7 @@
 //! leaves process memory.
 //!
 //! **Password check.** A known plaintext sealed under the key is stored with the salt, and every
-//! **Password check.** A known plaintext sealed under the key is stored with the salt, and every
 //! open checks it: a rotated or mistyped password is refused up front rather than leaving the
-//! store looking empty. A database that predates the verifier adopts the password of its next
-//! open.
 //! store looking empty. A database that predates the verifier adopts the password of its next
 //! open.
 //!
