@@ -52,8 +52,9 @@ the Safe or its module — just the node's own chain key to sign the module call
 
 At runtime it needs a Blokli endpoint that exposes the Curvy deployment, the Curvy Groth16 proving artifacts (`CURVY_ZK_KEYS_DIR`: the five
 zkeys and five witness graphs published with each [`rs-sdk` release](https://github.com/0xCurvy/rs-sdk/releases), digest-checked on load),
-a state file that survives restarts, and the **PIX recovery password**: the environment variable named by the strategy's
-`pix_recovery_password_env` must be set, because the state file's spender identity and scan secrets are sealed under it. Use the same
+a state file that survives restarts, and the **PIX recovery password**: the strategy's `pix_recovery_password` (or, failing that, the
+environment variable named by `pix_recovery_password_env`) must be set, because the state file's spender identity and scan secrets are
+sealed under it. Use the same
 password on every start — the file refuses any other — and do not lose it: the sealed identity owns the pool's shielded float, and
 without the password there is no way to spend it. Under `submission: relayer` it also needs a relayer URL, and **no EVM key of its own**;
 under `submission: operator` it needs the Curvy operator's key in the environment (`HOPRD_CURVY_OPERATOR_PRIVATE_KEY` by default). See the

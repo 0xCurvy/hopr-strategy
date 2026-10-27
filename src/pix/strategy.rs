@@ -246,10 +246,18 @@ pub struct PixStrategyConfig {
     /// the recovered key — the only means of moving those funds — is lost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pix_recovery_db_path: Option<std::path::PathBuf>,
-    /// Name of the environment variable holding the password the PIX secrets on disk are sealed
-    /// under: the recovery store, and the Curvy pool's state file (its spender identity and scan
-    /// secrets). Required when [`Self::pix_recovery_db_path`] is set, and always by the Curvy
-    /// pool. The same password on every start: both files refuse any other.
+    /// The password the PIX secrets on disk are sealed under: the recovery store, and the Curvy
+    /// pool's state file (its spender identity and scan secrets). Required when
+    /// [`Self::pix_recovery_db_path`] is set, and always by the Curvy pool. The same password on
+    /// every start: both files refuse any other.
+    ///
+    /// Never serialized back out, and printed redacted, so the configuration can be dumped and
+    /// logged without exposing it. [`Self::pix_recovery_password_env`] is the alternative for a
+    /// deployment that would rather not write it into the configuration file.
+    #[serde(default, skip_serializing)]
+    pub pix_recovery_password: Option<PixRecoveryPassword>,
+    /// Name of an environment variable to read the password from when
+    /// [`Self::pix_recovery_password`] is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pix_recovery_password_env: Option<String>,
     /// How long to wait for additional deposit events before flushing the batch.
@@ -621,13 +629,36 @@ impl PixStrategy {
     }
 }
 
+/// A password held in [`PixStrategyConfig`]: deserialized from the plain string, never serialized,
+/// and shown redacted by `Debug` so a logged or dumped configuration does not leak it.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct PixRecoveryPassword(String);
+
+impl Debug for PixRecoveryPassword {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl From<String> for PixRecoveryPassword {
+    fn from(password: String) -> Self {
+        Self(password)
+    }
+}
+
 impl PixStrategyConfig {
-    /// The password the PIX secrets on disk are sealed under, read from the environment variable
-    /// [`Self::pix_recovery_password_env`] names. `purpose` says which store asked, for the error
-    /// when the field or the variable is unset.
+    /// The password the PIX secrets on disk are sealed under: [`Self::pix_recovery_password`], or
+    /// failing that the environment variable [`Self::pix_recovery_password_env`] names. `purpose`
+    /// says which store asked, for the error when neither is set.
     pub fn pix_recovery_password(&self, purpose: &str) -> Result<String> {
+        if let Some(PixRecoveryPassword(password)) = &self.pix_recovery_password {
+            return Ok(password.clone());
+        }
         let env = self.pix_recovery_password_env.as_deref().ok_or_else(|| {
-            StrategyError::InvalidConfiguration(format!("pix_recovery_password_env must be set: {purpose}"))
+            StrategyError::InvalidConfiguration(format!(
+                "pix_recovery_password or pix_recovery_password_env must be set: {purpose}"
+            ))
         })?;
         std::env::var(env).map_err(|_| {
             StrategyError::InvalidConfiguration(format!("environment variable {env} must be set: {purpose}"))
@@ -636,18 +667,15 @@ impl PixStrategyConfig {
 }
 
 fn open_recovery_store(cfg: &PixStrategyConfig) -> Result<Option<PixRecoveryStore>> {
-    match (&cfg.pix_recovery_db_path, &cfg.pix_recovery_password_env) {
-        (Some(path), Some(_)) => {
+    match &cfg.pix_recovery_db_path {
+        Some(path) => {
             let password = cfg.pix_recovery_password("PIX recovery persistence is enabled")?;
             PixRecoveryStore::open(path, &password)
                 .map(Some)
                 .map_err(StrategyError::other)
         }
         // A password alone is not a mistake: the Curvy pool's state file is sealed under it too.
-        (None, _) => Ok(None),
-        (Some(_), None) => Err(StrategyError::InvalidConfiguration(
-            "pix_recovery_password_env must be set when pix_recovery_db_path is set".to_owned(),
-        )),
+        None => Ok(None),
     }
 }
 
@@ -2841,6 +2869,44 @@ mod tests {
     /// `nodeOnly` check accepts from the node alone — so a foreign key is refused at startup
     /// rather than reverting every shield.
     #[cfg(feature = "strategy-pix-curvy")]
+    #[test]
+    fn test_pix_recovery_password_prefers_the_configured_value_over_the_environment() {
+        const ENV: &str = "HOPRD_TEST_PIX_RECOVERY_PASSWORD_PRECEDENCE";
+
+        let neither = PixStrategyConfig::default();
+        match neither.pix_recovery_password("test") {
+            Err(StrategyError::InvalidConfiguration(message)) => {
+                assert!(message.contains("pix_recovery_password"), "{message}")
+            }
+            other => panic!("expected a missing password, got {:?}", other.err()),
+        }
+
+        let from_env = PixStrategyConfig {
+            pix_recovery_password_env: Some(ENV.to_owned()),
+            ..Default::default()
+        };
+        // SAFETY: `ENV` is touched by this test alone, so no other test thread can observe or
+        // clobber it.
+        unsafe { std::env::set_var(ENV, "from the environment") };
+        assert_eq!(from_env.pix_recovery_password("test").unwrap(), "from the environment");
+
+        let configured = PixStrategyConfig {
+            pix_recovery_password: Some("from the configuration".to_owned().into()),
+            ..from_env
+        };
+        assert_eq!(
+            configured.pix_recovery_password("test").unwrap(),
+            "from the configuration"
+        );
+        unsafe { std::env::remove_var(ENV) };
+
+        // The configured password is neither printed nor written back out.
+        assert!(!format!("{configured:?}").contains("from the configuration"));
+        let dumped = serde_json::to_string(&configured).unwrap();
+        assert!(!dumped.contains("\"pix_recovery_password\""), "{dumped}");
+        assert!(dumped.contains("\"pix_recovery_password_env\""), "{dumped}");
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_build_curvy_rejects_a_foreign_node_key_for_direct_shielding() -> anyhow::Result<()> {
         use hopr_api::types::crypto::prelude::BjjPublicKey;

@@ -89,8 +89,8 @@
 //! rather than being dropped.
 //!
 //! The store is only opened in the Exit role (when
-//! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_db_path`] and
-//! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_password_env`] are both set).
+//! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_db_path`] is set), under the password
+//! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_password`] resolves.
 
 use std::{path::Path, sync::Arc};
 
