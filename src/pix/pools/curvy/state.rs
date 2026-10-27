@@ -16,8 +16,8 @@
 //! available to both [`notify_deposit`] and withdrawal after a restart.
 //!
 //! **Secrets are sealed at rest.** The scan secrets here, and the spender identity the SDK bridge
-//! keeps in the same file, are stored under a key derived from the configured state password
-//! (the scheme is `pix::sealed`'s, shared with the recovery store). The file
+//! keeps in the same file, are stored under a key derived from the PIX recovery password
+//! (the scheme is `pix::store::sealed`'s, shared with the recovery store). The file
 //! mode keeps other local users out; the sealing keeps a backup or a copied disk from being
 //! spending authority over the pool's float. A database written before sealing existed is
 //! sealed in place on its next open.
@@ -42,9 +42,9 @@ use hopr_api::{
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use super::{CommittedCurvyNote, DetectedCurvyNote, OwnedCurvyDeposit, detect::parse_curvy_note_id};
-use crate::pix::{
+use crate::pix::store::{
+    private_db::open_private_database,
     sealed::{PasswordSlots, SEALED_32_SIZE, Sealer, UnlockError},
-    store::private_db::open_private_database,
 };
 
 const CURSOR_TABLE: TableDefinition<u8, Vec<u8>> = TableDefinition::new("curvy_pix_cursor");
@@ -54,7 +54,7 @@ const OWNED_NOTES_TABLE: TableDefinition<[u8; OWNED_NOTE_KEY_SIZE], Vec<u8>> =
     TableDefinition::new("curvy_pix_owned_notes_v2");
 const NOTE_SESSIONS_TABLE: TableDefinition<[u8; NOTE_ID_SIZE], [u8; PixAddressId::SIZE]> =
     TableDefinition::new("curvy_pix_note_sessions");
-/// Per-SSA scan secrets, keyed by allocation and sealed under the state password. See the module
+/// Per-SSA scan secrets, keyed by allocation and sealed under the PIX recovery password. See the module
 /// docs for the ordering they rely on.
 pub(super) const SCAN_SECRETS_TABLE: TableDefinition<[u8; PixAddressId::SIZE], Vec<u8>> =
     TableDefinition::new("curvy_pix_sealed_scan_secrets");

@@ -56,7 +56,7 @@
 //! index.  The key is deterministic (no randomness), so `contains()` and
 //! `insert()` work naturally.
 //!
-//! The scheme is `pix::sealed`'s, shared with the Curvy state store; this module
+//! The scheme is `pix::store::sealed`'s, shared with the Curvy state store; this module
 //! fixes the tables, the verifier text and the slot layout that existing databases were written
 //! with.
 //!
@@ -97,9 +97,9 @@ use std::{path::Path, sync::Arc};
 use hopr_api::{chain::PixDepositSecret, node::PixAddressId, types::primitive::traits::BytesRepresentable};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-use super::{
+use super::store::{
+    private_db::{PrivateDatabaseError, open_private_database},
     sealed::{PasswordSlots, SEALED_32_SIZE, SealError, Sealer, UnlockError},
-    store::private_db::{PrivateDatabaseError, open_private_database},
 };
 
 // Key = pseudonym (10 bytes) + ssa_index (4 bytes), which is exactly the
@@ -511,7 +511,7 @@ impl PixRecoveryStore {
 
 #[cfg(test)]
 mod tests {
-    /// Records written by the store before the sealing scheme moved to `pix::sealed`, so the
+    /// Records written by the store before the sealing scheme moved to `pix::store::sealed`, so the
     /// on-disk format (salt, verifier, entry layout and associated data) is pinned.
     #[test]
     fn test_opens_a_database_written_by_the_previous_layout() -> anyhow::Result<()> {

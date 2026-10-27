@@ -2935,7 +2935,7 @@ mod tests {
             Err(StrategyError::InvalidConfiguration(message)) => {
                 assert!(message.contains("pix_recovery_password_env"), "{message}")
             }
-            other => panic!("expected a missing state password, got {:?}", other.err()),
+            other => panic!("expected a missing recovery password, got {:?}", other.err()),
         }
         // ...and so is the variable it names.
         let result =
@@ -2944,7 +2944,7 @@ mod tests {
             Err(StrategyError::InvalidConfiguration(message)) => {
                 assert!(message.contains(STATE_PASSWORD_ENV), "{message}")
             }
-            other => panic!("expected a missing state password, got {:?}", other.err()),
+            other => panic!("expected a missing recovery password, got {:?}", other.err()),
         }
 
         // SAFETY: `STATE_PASSWORD_ENV` is touched by this test alone, so no other test thread

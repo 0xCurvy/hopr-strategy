@@ -77,7 +77,7 @@ use super::{
     state::{RedbCurvyDepositState, SPENDER_AAD, id_bytes},
     token::VaultToken,
 };
-use crate::pix::sealed::Sealer;
+use crate::pix::store::sealed::Sealer;
 
 const SDK_STATE_TABLE: TableDefinition<u8, Vec<u8>> = TableDefinition::new("curvy_pix_sdk_state");
 const SDK_STATE_KEY: u8 = 0;
@@ -574,7 +574,7 @@ struct StoredSpender {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct SdkState {
-    /// The spender identity, sealed under the state password: hex of what
+    /// The spender identity, sealed under the PIX recovery password: hex of what
     /// [`RedbCurvySdkStore::set_spender`] produced. Read through [`RedbCurvySdkStore::spender`].
     #[serde(default)]
     sealed_spender: Option<String>,
