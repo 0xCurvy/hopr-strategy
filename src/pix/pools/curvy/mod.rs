@@ -87,8 +87,9 @@
 //! * A **state file** ([`CurvyDepositPoolConfig::state_path`]) that survives restarts: it holds the node's Curvy
 //!   identity, the funding notes, every discovered note and the scan secrets. Losing it loses the ability to sweep what
 //!   has not been swept yet.
-//! * A **state password**, from the environment variable named by [`CurvyDepositPoolConfig::state_password_env`]. The
-//!   identity and the scan secrets in the state file are sealed under it, so a copy of the file is not spending
+//! * The **PIX recovery password**, from the environment variable named by
+//!   [`PixStrategyConfig::pix_recovery_password_env`](crate::pix::strategy::PixStrategyConfig::pix_recovery_password_env).
+//!   The identity and the scan secrets in the state file are sealed under it, so a copy of the file is not spending
 //!   authority over the float. It must be the same on every start: a different one is refused, and losing it loses
 //!   the identity that owns the float. See `state` for the scheme.
 //!
@@ -336,10 +337,6 @@ fn default_operator_key_env() -> String {
     "HOPRD_CURVY_OPERATOR_PRIVATE_KEY".to_owned()
 }
 
-fn default_state_password_env() -> String {
-    "HOPRD_CURVY_STATE_PASSWORD".to_owned()
-}
-
 /// The canonical Gnosis Safe MultiSend: the default of the deprecated
 /// [`CurvyDepositPoolConfig::safe_multisend_address`], which nothing reads any more.
 const SAFE_MULTI_SEND_ADDRESS: [u8; 20] = [
@@ -458,16 +455,6 @@ pub struct CurvyDepositPoolConfig {
     #[default(default_operator_key_env())]
     #[serde(default = "default_operator_key_env")]
     pub operator_key_env: String,
-
-    /// Name of the environment variable holding the password the state file's secrets are sealed
-    /// under. Default: `HOPRD_CURVY_STATE_PASSWORD`. Always required.
-    ///
-    /// The same indirection as [`Self::operator_key_env`], and the same password on every start:
-    /// the file refuses any other, and the spender identity that owns the float is only
-    /// readable with it.
-    #[default(default_state_password_env())]
-    #[serde(default = "default_state_password_env")]
-    pub state_password_env: String,
 
     /// How the float reaches the shielded vault. Default: [`CurvyShielding::Direct`] — no entry
     /// portal. Overridden by [`SHIELDING_ENV`].
@@ -818,16 +805,18 @@ where
     N: HasChainApi + Send + Sync + 'static,
 {
     /// Creates the production pool: a Blokli client from `cfg.blokli_url`, the state file from
-    /// `cfg.state_path`, the operator key from the environment, and the Safe as the shield's
-    /// funding source.
+    /// `cfg.state_path` sealed under `state_password` (the PIX recovery password, see
+    /// [`PixStrategyConfig::pix_recovery_password`](crate::pix::strategy::PixStrategyConfig::pix_recovery_password)),
+    /// the operator key from the environment, and the Safe as the shield's funding source.
     ///
     /// Fails — rather than deferring to the first deposit — when the operator key is not set, the
-    /// state file cannot be opened, an environment override does not parse, or direct shielding is
-    /// given a key that is not the node's.
+    /// state file cannot be opened or refuses the password, an environment override does not
+    /// parse, or direct shielding is given a key that is not the node's.
     pub fn new(
         node: Arc<N>,
         node_key: hopr_api::ChainKeypair,
         mut cfg: CurvyDepositPoolConfig,
+        state_password: &str,
     ) -> Result<Self, StrategyError> {
         // Environment overrides are applied before validation, so an override that contradicts
         // the file is caught here rather than at the first deposit.
@@ -890,13 +879,7 @@ where
             .state_path
             .clone()
             .unwrap_or_else(|| PathBuf::from(format!("curvy-pix-{}.redb", node.identity().node_address)));
-        let state_password = std::env::var(&cfg.state_password_env).map_err(|_| {
-            StrategyError::InvalidConfiguration(format!(
-                "environment variable {} must hold the password the Curvy state file is sealed under",
-                cfg.state_password_env
-            ))
-        })?;
-        let state = RedbCurvyDepositState::open(&state_path, &state_password)
+        let state = RedbCurvyDepositState::open(&state_path, state_password)
             .map_err(|error| StrategyError::other(anyhow::anyhow!("{}: {error}", state_path.display())))?;
         let blokli = Arc::new(BlokliClient::new(cfg.blokli_url.clone(), BlokliClientConfig::default()));
         // One handle, shared by the bridge that stamps the id on notes and the tracker whose
