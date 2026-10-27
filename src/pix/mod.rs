@@ -93,6 +93,7 @@
 
 pub mod pools;
 pub mod recovery_store;
+mod sealed;
 mod store;
 pub mod strategy;
 
