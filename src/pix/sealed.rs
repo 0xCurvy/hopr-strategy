@@ -247,13 +247,13 @@ mod tests {
     #[test]
     fn unlock_adopts_the_password_of_a_database_without_a_verifier() {
         let db = in_memory();
-        drop(SLOTS.unlock(&db, "one").unwrap());
+        SLOTS.unlock(&db, "one").unwrap();
         {
             let write = db.begin_write().unwrap();
             write.delete_table(SLOTS.verifier).unwrap();
             write.commit().unwrap();
         }
-        drop(SLOTS.unlock(&db, "two").unwrap());
+        SLOTS.unlock(&db, "two").unwrap();
         assert!(matches!(SLOTS.unlock(&db, "one"), Err(UnlockError::WrongPassword)));
     }
 }

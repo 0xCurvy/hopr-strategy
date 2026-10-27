@@ -56,7 +56,7 @@
 //! index.  The key is deterministic (no randomness), so `contains()` and
 //! `insert()` work naturally.
 //!
-//! The scheme is [`sealed`](super::sealed)'s, shared with the Curvy state store; this module
+//! The scheme is `pix::sealed`'s, shared with the Curvy state store; this module
 //! fixes the tables, the verifier text and the slot layout that existing databases were written
 //! with.
 //!

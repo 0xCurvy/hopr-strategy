@@ -15,6 +15,13 @@
 //! Owned notes stay stored after commitment. Reopening the same database therefore makes them
 //! available to both [`notify_deposit`] and withdrawal after a restart.
 //!
+//! **Secrets are sealed at rest.** The scan secrets here, and the spender identity the SDK bridge
+//! keeps in the same file, are stored under a key derived from the configured state password
+//! (the scheme is `pix::sealed`'s, shared with the recovery store). The file
+//! mode keeps other local users out; the sealing keeps a backup or a copied disk from being
+//! spending authority over the pool's float. A database written before sealing existed is
+//! sealed in place on its next open.
+//!
 //! [`generate_deposit_data`]: hopr_api::chain::DepositPool::generate_deposit_data
 //! [`notify_deposit`]: hopr_api::chain::DepositPool::notify_deposit
 
@@ -35,7 +42,10 @@ use hopr_api::{
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use super::{CommittedCurvyNote, DetectedCurvyNote, OwnedCurvyDeposit, detect::parse_curvy_note_id};
-use crate::pix::store::private_db::open_private_database;
+use crate::pix::{
+    sealed::{PasswordSlots, SEALED_32_SIZE, Sealer, UnlockError},
+    store::private_db::open_private_database,
+};
 
 const CURSOR_TABLE: TableDefinition<u8, Vec<u8>> = TableDefinition::new("curvy_pix_cursor");
 const NOTE_ID_SIZE: usize = 32;
@@ -44,9 +54,29 @@ const OWNED_NOTES_TABLE: TableDefinition<[u8; OWNED_NOTE_KEY_SIZE], Vec<u8>> =
     TableDefinition::new("curvy_pix_owned_notes_v2");
 const NOTE_SESSIONS_TABLE: TableDefinition<[u8; NOTE_ID_SIZE], [u8; PixAddressId::SIZE]> =
     TableDefinition::new("curvy_pix_note_sessions");
-/// Per-SSA scan secrets, keyed by allocation. See the module docs for the ordering they rely on.
-const SCAN_SECRETS_TABLE: TableDefinition<[u8; PixAddressId::SIZE], Vec<u8>> =
+/// Per-SSA scan secrets, keyed by allocation and sealed under the state password. See the module
+/// docs for the ordering they rely on.
+pub(super) const SCAN_SECRETS_TABLE: TableDefinition<[u8; PixAddressId::SIZE], Vec<u8>> =
+    TableDefinition::new("curvy_pix_sealed_scan_secrets");
+/// Where databases written before sealing kept the same secrets in the clear. Drained into
+/// [`SCAN_SECRETS_TABLE`] and dropped on open.
+pub(super) const LEGACY_SCAN_SECRETS_TABLE: TableDefinition<[u8; PixAddressId::SIZE], Vec<u8>> =
     TableDefinition::new("curvy_pix_scan_secrets");
+const KDF_SALT_TABLE: TableDefinition<u8, [u8; 16]> = TableDefinition::new("curvy_pix_kdf_salt");
+const KDF_VERIFIER_TABLE: TableDefinition<u8, [u8; SEALED_32_SIZE]> = TableDefinition::new("curvy_pix_kdf_verifier");
+const PASSWORD_SLOTS: PasswordSlots = PasswordSlots {
+    salt: KDF_SALT_TABLE,
+    verifier: KDF_VERIFIER_TABLE,
+    verifier_plaintext: *b"hopr-pix-curvy-state-db-verifier",
+    verifier_aad: b"curvy-pix:verifier",
+};
+/// The slot a scan secret is sealed into: this tag followed by the allocation id.
+const SCAN_SECRET_AAD_TAG: &[u8] = b"curvy-pix:scan-secret:";
+/// The slot the SDK bridge seals the node's spender identity into.
+pub(super) const SPENDER_AAD: &[u8] = b"curvy-pix:spender";
+/// Password every test store is opened with.
+#[cfg(test)]
+pub(super) const TEST_PASSWORD: &str = "curvy test state password";
 const PENDING_CURSOR_KEY: u8 = 0;
 const COMMITTED_CURSOR_KEY: u8 = 1;
 const CURSOR_SIZE_WITHOUT_HASH: usize = 32;
@@ -60,10 +90,16 @@ pub enum CurvyStateError {
     Database(String),
     #[error("corrupt Curvy PIX state: {0}")]
     Corrupt(String),
+    #[error("the configured password does not match the Curvy PIX state database")]
+    WrongPassword,
 }
 
 fn state_db_error(error: impl std::fmt::Display) -> CurvyStateError {
     CurvyStateError::Database(error.to_string())
+}
+
+fn scan_secret_aad(id: &PixAddressId) -> Vec<u8> {
+    [SCAN_SECRET_AAD_TAG, id.as_ref()].concat()
 }
 
 /// The fixed-size encoding of an allocation id, as the tables key on it.
@@ -275,7 +311,7 @@ fn session_note_range(id: &PixAddressId) -> ([u8; OWNED_NOTE_KEY_SIZE], [u8; OWN
 /// }
 ///
 /// let dir = tempfile::tempdir()?;
-/// resume_from(&RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?)?;
+/// resume_from(&RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"), "correct horse battery")?)?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub trait CurvyDepositState: Send + Sync + 'static {
@@ -331,13 +367,17 @@ pub trait CurvyDepositState: Send + Sync + 'static {
 /// Redb-backed Curvy lifecycle state.
 pub struct RedbCurvyDepositState {
     db: Arc<redb::Database>,
+    sealer: Sealer,
 }
 
 impl RedbCurvyDepositState {
-    /// Opens (or creates) the durable note store at a node-stable path.
+    /// Opens (or creates) the durable note store at a node-stable path, sealed under `password`.
     ///
     /// The path must be reused across restarts; an ephemeral path loses the private note state
-    /// that makes committed deposits sweepable.
+    /// that makes committed deposits sweepable. The password must be the one the file was first
+    /// opened with, or this fails with [`CurvyStateError::WrongPassword`]; a database written
+    /// before sealing existed adopts the password of this open and has its secrets sealed in
+    /// place.
     ///
     /// ```
     /// # use hopr_strategy::pix::pools::curvy::{CurvyDepositState, CurvyEventKind, RedbCurvyDepositState};
@@ -346,23 +386,23 @@ impl RedbCurvyDepositState {
     /// let path = dir
     ///     .path()
     ///     .join("curvy-pix-0x0000000000000000000000000000000000000001.redb");
-    /// let state = RedbCurvyDepositState::open(&path)?;
+    /// let state = RedbCurvyDepositState::open(&path, "correct horse battery")?;
     /// assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
     /// drop(state);
     /// // Reopening finds the same store rather than a fresh one.
-    /// let state = RedbCurvyDepositState::open(&path)?;
+    /// let state = RedbCurvyDepositState::open(&path, "correct horse battery")?;
     /// assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
     /// # Ok::<(), anyhow::Error>(())
     /// ```
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, CurvyStateError> {
+    pub fn open(path: impl AsRef<Path>, password: &str) -> Result<Self, CurvyStateError> {
         let db = open_private_database(path).map_err(state_db_error)?;
-        let write = db.begin_write().map_err(state_db_error)?;
-        write.open_table(CURSOR_TABLE).map_err(state_db_error)?;
-        write.open_table(OWNED_NOTES_TABLE).map_err(state_db_error)?;
-        write.open_table(NOTE_SESSIONS_TABLE).map_err(state_db_error)?;
-        write.open_table(SCAN_SECRETS_TABLE).map_err(state_db_error)?;
-        write.commit().map_err(state_db_error)?;
-        Ok(Self { db: Arc::new(db) })
+        let sealer = PASSWORD_SLOTS.unlock(&db, password).map_err(|error| match error {
+            UnlockError::WrongPassword => CurvyStateError::WrongPassword,
+            other => state_db_error(other),
+        })?;
+        let state = Self::with_database(db, sealer)?;
+        state.seal_legacy_scan_secrets()?;
+        Ok(state)
     }
 
     #[cfg(test)]
@@ -370,19 +410,65 @@ impl RedbCurvyDepositState {
         let db = redb::Database::builder()
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .map_err(state_db_error)?;
+        Self::with_database(db, Sealer::random())
+    }
+
+    fn with_database(db: redb::Database, sealer: Sealer) -> Result<Self, CurvyStateError> {
         let write = db.begin_write().map_err(state_db_error)?;
         write.open_table(CURSOR_TABLE).map_err(state_db_error)?;
         write.open_table(OWNED_NOTES_TABLE).map_err(state_db_error)?;
         write.open_table(NOTE_SESSIONS_TABLE).map_err(state_db_error)?;
         write.open_table(SCAN_SECRETS_TABLE).map_err(state_db_error)?;
         write.commit().map_err(state_db_error)?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            sealer,
+        })
+    }
+
+    /// Moves every scan secret a pre-sealing database kept in the clear into the sealed table,
+    /// and drops the clear table, in one transaction.
+    fn seal_legacy_scan_secrets(&self) -> Result<(), CurvyStateError> {
+        let write = self.db.begin_write().map_err(state_db_error)?;
+        let moved = {
+            let legacy = write.open_table(LEGACY_SCAN_SECRETS_TABLE).map_err(state_db_error)?;
+            let mut sealed = write.open_table(SCAN_SECRETS_TABLE).map_err(state_db_error)?;
+            let mut moved = 0usize;
+            for entry in legacy.iter().map_err(state_db_error)? {
+                let (key, value) = entry.map_err(state_db_error)?;
+                let id = PixAddressId::try_from(key.value().as_slice()).map_err(|error| {
+                    CurvyStateError::Corrupt(format!("invalid stored Curvy scan secret id: {error}"))
+                })?;
+                let secret = self
+                    .sealer
+                    .seal(&scan_secret_aad(&id), &value.value())
+                    .map_err(state_db_error)?;
+                sealed.insert(key.value(), secret).map_err(state_db_error)?;
+                moved += 1;
+            }
+            moved
+        };
+        write.delete_table(LEGACY_SCAN_SECRETS_TABLE).map_err(state_db_error)?;
+        write.commit().map_err(state_db_error)?;
+        if moved > 0 {
+            tracing::info!(
+                count = moved,
+                "sealed the Curvy scan secrets of a pre-sealing state database"
+            );
+        }
+        Ok(())
     }
 
     /// The database, shared with the SDK bridge so its state lives in the same file and is wiped
     /// together with this one.
     pub(super) fn shared_database(&self) -> Arc<redb::Database> {
         Arc::clone(&self.db)
+    }
+
+    /// The key this store's secrets are sealed under, shared with the SDK bridge so the spender
+    /// identity it keeps in the same file is sealed the same way.
+    pub(super) fn sealer(&self) -> Sealer {
+        self.sealer.clone()
     }
 
     fn put_cursor(
@@ -564,9 +650,11 @@ impl CurvyDepositState for RedbCurvyDepositState {
         let write = self.db.begin_write().map_err(state_db_error)?;
         {
             let mut table = write.open_table(SCAN_SECRETS_TABLE).map_err(state_db_error)?;
-            table
-                .insert(id_bytes(id), secret.to_bytes().as_ref().to_vec())
+            let sealed = self
+                .sealer
+                .seal(&scan_secret_aad(id), secret.to_bytes().as_ref())
                 .map_err(state_db_error)?;
+            table.insert(id_bytes(id), sealed).map_err(state_db_error)?;
         }
         write.commit().map_err(state_db_error)
     }
@@ -578,7 +666,11 @@ impl CurvyDepositState for RedbCurvyDepositState {
             .get(id_bytes(id))
             .map_err(state_db_error)?
             .map(|value| {
-                CurvyScanSecret::try_from(value.value().as_slice())
+                let secret = self
+                    .sealer
+                    .open(&scan_secret_aad(id), &value.value())
+                    .map_err(|error| CurvyStateError::Corrupt(format!("sealed Curvy scan secret: {error}")))?;
+                CurvyScanSecret::try_from(secret.as_slice())
                     .map_err(|error| CurvyStateError::Corrupt(format!("invalid stored Curvy scan secret: {error}")))
             })
             .transpose()

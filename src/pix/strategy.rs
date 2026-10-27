@@ -2836,11 +2836,14 @@ mod tests {
     async fn test_build_curvy_rejects_a_foreign_node_key_for_direct_shielding() -> anyhow::Result<()> {
         use hopr_api::types::crypto::prelude::BjjPublicKey;
 
+        const STATE_PASSWORD_ENV: &str = "HOPRD_TEST_CURVY_STATE_PASSWORD_BUILD";
+
         let (_cc, node, _pool) = entry_side(&[]).await?;
         let state = tempfile::tempdir()?;
         let cfg = || crate::pix::pools::curvy::PoolConfig {
             relayer_url: Some("http://127.0.0.1:1/".parse().unwrap()),
             state_path: Some(state.path().join("curvy.redb")),
+            state_password_env: STATE_PASSWORD_ENV.to_owned(),
             ..Default::default()
         };
 
@@ -2854,7 +2857,26 @@ mod tests {
             other => panic!("expected a rejected node key, got {:?}", other.err()),
         }
 
-        PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(node, BOB_KP.clone(), cfg())?;
+        // The state file's secrets are sealed under a password the environment must supply.
+        let result = PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(
+            Arc::clone(&node),
+            BOB_KP.clone(),
+            cfg(),
+        );
+        match result {
+            Err(StrategyError::InvalidConfiguration(message)) => {
+                assert!(message.contains(STATE_PASSWORD_ENV), "{message}")
+            }
+            other => panic!("expected a missing state password, got {:?}", other.err()),
+        }
+
+        // SAFETY: `STATE_PASSWORD_ENV` is touched by this test alone, so no other test thread
+        // can observe or clobber it.
+        unsafe { std::env::set_var(STATE_PASSWORD_ENV, "test_password") };
+        let built =
+            PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(node, BOB_KP.clone(), cfg());
+        unsafe { std::env::remove_var(STATE_PASSWORD_ENV) };
+        built?;
         Ok(())
     }
 
