@@ -272,6 +272,20 @@ fn detector_skips_notes_of_another_token() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn detector_ignores_zero_amount_notes() -> anyhow::Result<()> {
+    // Sealed correctly to the allocation, so everything but the amount would make it ours: the
+    // sweep refuses zero-amount inputs, and a recorded one would block the allocation's sweep.
+    let fixture = owned_candidate(1)?;
+    let (zero, _) = pending_note_for(&fixture.scan_secret.public(), &fixture.address, 0, 4, "5", 2)?;
+    let watched = [(fixture.id, fixture.address, fixture.scan_secret.clone())];
+
+    assert!(fixture.detector.detect_owned_note(&zero, &watched)?.is_none());
+    // The same allocation still finds its real note.
+    assert!(fixture.detector.detect_owned_note(&fixture.note, &watched)?.is_some());
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
