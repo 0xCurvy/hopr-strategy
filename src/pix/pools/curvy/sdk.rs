@@ -2350,11 +2350,15 @@ where
     /// [`MAX_NOTE_SELECTION_STEPS`], because a deposit address holds a handful of notes and an
     /// unbounded subset-sum over a pathological one is not worth stalling a sweep for. When
     /// nothing exact is found, the greedy prefix is still what the error reports.
+    ///
+    /// Zero-amount notes are left out: the withdrawal refuses them as inputs, and the scan stores
+    /// none, but a store written before it may hold some.
     fn select_notes(
         notes: Vec<CommittedCurvyNote>,
         amount: Option<HoprBalance>,
     ) -> Result<Vec<OwnedNote>, RsSdkCurvyAdapterError> {
         let mut notes = notes.iter().map(Self::owned_note).collect::<Result<Vec<_>, _>>()?;
+        notes.retain(|note| note.amount != Fr::from(0u8));
         let Some(target) = amount else {
             return Ok(notes);
         };
@@ -4828,6 +4832,29 @@ mod tests {
         let (big_k, big_v) = short_key_identity()?;
         assert_eq!(adapter.spender.big_k, big_k);
         assert_eq!(adapter.spender.big_v, big_v);
+        Ok(())
+    }
+
+    #[test]
+    fn withdrawals_leave_out_zero_amount_notes() -> anyhow::Result<()> {
+        let amounts = |selected: Vec<OwnedNote>| {
+            selected
+                .iter()
+                .map(|note| u128::try_from(fr_to_biguint(&note.amount)).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            amounts(Adapter::select_notes(vec![fixture(7), fixture(0)], None)?),
+            vec![7]
+        );
+        assert!(Adapter::select_notes(vec![fixture(0)], None)?.is_empty());
+        assert_eq!(
+            amounts(Adapter::select_notes(
+                vec![fixture(0), fixture(5), fixture(7)],
+                Some(HoprBalance::from(U256::from(5_u8)))
+            )?),
+            vec![5]
+        );
         Ok(())
     }
 
