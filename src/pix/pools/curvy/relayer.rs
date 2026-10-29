@@ -522,6 +522,27 @@ impl RelayClient {
     /// [`await_inclusion`](Self::await_inclusion) to wait for it to land. A `409` on the spend key
     /// resolves to the in-flight submission rather than an error: the notes are being spent
     /// exactly once, which is the outcome we wanted.
+    ///
+    /// ```no_run
+    /// # use hopr_strategy::pix::pools::curvy::relayer::{RelayClient, RelayError};
+    /// # async fn relay(client: &RelayClient, request: &curvy_sdk::PixWithdrawalRequest) -> Result<(), RelayError> {
+    /// let submission = client
+    ///     .submit(
+    ///         curvy_abi::RelayAction::Withdrawal,
+    ///         100, // EVM chain id: Gnosis
+    ///         request.max_inputs,
+    ///         request.circuit, // the circuit family version the proof was made for
+    ///         &request.proof,
+    ///         &request.public_signals,
+    ///         &request.request_key,
+    ///         &request.spend_key,
+    ///         "6f1c2a7e-0b9d-4e53-9a41-2d8c5b7f3e10", // the journalled intent id
+    ///     )
+    ///     .await?;
+    /// # let _ = submission;
+    /// # Ok(())
+    /// # }
+    /// ```
     #[allow(clippy::too_many_arguments)]
     pub async fn submit(
         &self,
