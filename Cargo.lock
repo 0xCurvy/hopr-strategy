@@ -4100,7 +4100,7 @@ dependencies = [
 [[package]]
 name = "hopr-api"
 version = "4.4.1"
-source = "git+https://github.com/0xCurvy/hopr-api.git?branch=lazar%2Fshield-router#9b321e35ead97ccc241ebfef7ba0848620d5327c"
+source = "git+https://github.com/0xCurvy/hopr-api.git?branch=lazar%2Fshield-router#296b4ca763e4226098e2c273c95f149ebe5e81a6"
 dependencies = [
  "async-trait",
  "atomic_enum",
@@ -4138,7 +4138,7 @@ dependencies = [
 [[package]]
 name = "hopr-chain-connector"
 version = "0.28.0"
-source = "git+https://github.com/0xCurvy/hopr-impls.git?branch=lazar%2Fshield-router#5b6f8c94daa544d097103a32f0231f2e1d6c574b"
+source = "git+https://github.com/0xCurvy/hopr-impls.git?branch=lazar%2Fshield-router#25d53466b9d59c730facacd982b03f7d861e7717"
 dependencies = [
  "ahash",
  "anyhow",
@@ -4239,7 +4239,7 @@ dependencies = [
 [[package]]
 name = "hopr-types"
 version = "4.1.1"
-source = "git+https://github.com/0xCurvy/hopr-types.git?branch=lazar%2Fshield-router#caddb9e2e3b7d0d2855351fa5ac09d808f61fa8b"
+source = "git+https://github.com/0xCurvy/hopr-types.git?branch=lazar%2Fshield-router#13eb853c4afac7cc357d2c9d45411fe3d04bc6c4"
 dependencies = [
  "aes",
  "anyhow",
@@ -4299,7 +4299,7 @@ dependencies = [
 [[package]]
 name = "hopr-utilities"
 version = "0.17.3"
-source = "git+https://github.com/0xCurvy/hopr-utilities.git?branch=lazar%2Fshield-router#436c9b8e0e0f800a681150864d65ea1f0d32cc37"
+source = "git+https://github.com/0xCurvy/hopr-utilities.git?branch=lazar%2Fshield-router#cc9d049f3539c106ea7c1ac47a01a8da4bc1e431"
 dependencies = [
  "anyhow",
  "async-broadcast",
