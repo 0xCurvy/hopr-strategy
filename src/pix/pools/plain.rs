@@ -1106,16 +1106,6 @@ where
             .map(|_| ())
     }
 
-    /// Move a deposit to another address inside the pool.
-    ///
-    /// For a non-anonymous pool "inside the pool" is not a meaningful distinction — every address
-    /// is an ordinary Ethereum account and every movement is a plain transfer — so this is the
-    /// same operation as [`withdraw_deposit`](Self::withdraw_deposit) with a different
-    /// destination, and it shares the sweep's retry budget and gas top-up for that reason.
-    ///
-    /// An anonymous pool is where the two diverge: there a transfer can stay within the pool's
-    /// anonymity set while a withdrawal leaves it.
-    ///
     /// The Safe is this pool's funding: there is nothing to move it into, so this is refused
     /// rather than reported as done. Fund the Safe itself.
     async fn fund(&self, _amount: HoprBalance) -> Result<(), Self::Error> {
@@ -1133,6 +1123,16 @@ where
             .map_err(StrategyError::other)
     }
 
+    /// Move a deposit to another address inside the pool.
+    ///
+    /// For a non-anonymous pool "inside the pool" is not a meaningful distinction — every address
+    /// is an ordinary Ethereum account and every movement is a plain transfer — so this is the
+    /// same operation as [`withdraw_deposit`](Self::withdraw_deposit) with a different
+    /// destination, and it shares the sweep's retry budget and gas top-up for that reason.
+    ///
+    /// An anonymous pool is where the two diverge: there a transfer can stay within the pool's
+    /// anonymity set while a withdrawal leaves it.
+    ///
     /// From the funding: a plain Safe transfer, the same as [`deposit_funds_to`](Self::deposit_funds_to),
     /// which needs an `amount`. From a deposit: a withdrawal to the destination address.
     ///

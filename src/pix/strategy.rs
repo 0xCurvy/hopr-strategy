@@ -286,7 +286,9 @@ pub struct PixStrategyConfig {
 ///
 /// `min_available` should cover the deposits that can arrive while a funding lands, and a
 /// margin: [`available_balance`](DepositPool::available_balance) is the pool's own ledger, which
-/// for a privacy pool counts a funding note before it is spendable.
+/// for a privacy pool counts a funding note before it is spendable. It is also what one deposit
+/// can draw on, not everything the pool holds, so funding scattered over many small notes does
+/// not keep the top-up away.
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
@@ -1703,13 +1705,16 @@ where
         // it — including the one a zero buffer period triggers from inside a handler. See
         // `detach_flushes`.
         self.detach_flushes = true;
-        self.detach_startup_funding();
 
         let mut event_stream = self
             .node
             .subscribe_to_actionable_events(Some(&[ActionableEventDiscriminant::Pix]))
             .map_err(|e| StrategyError::Other(anyhow::anyhow!(e)))?
             .filter_map(|event| futures::future::ready(event.try_as_pix()));
+
+        // Only now that there is a strategy to fund for: a failed subscription returns above, and
+        // a task spawned before it would still have debited the Safe.
+        self.detach_startup_funding();
 
         let replay = self.recovery_store.clone().map(|store| {
             hopr_utils::runtime::prelude::spawn(replay_pending_recoveries(
@@ -4560,6 +4565,49 @@ mod tests {
         strategy.apply_funding_policy().await;
         let calls = funded.lock().clone();
         Ok(calls)
+    }
+
+    /// A strategy that never starts consuming events funds nothing: the startup top-up is
+    /// spawned only once the event subscription succeeded, so a failed `run` leaves the Safe
+    /// untouched.
+    #[test_log::test(tokio::test)]
+    async fn a_failed_subscription_funds_nothing() -> anyhow::Result<()> {
+        struct NoEvents;
+
+        impl ActionableEventSource for NoEvents {
+            fn subscribe_to_actionable_events(
+                &self,
+                _: Option<&[ActionableEventDiscriminant]>,
+            ) -> std::result::Result<futures::stream::BoxStream<'static, ActionableEvent>, String> {
+                Err("no event stream".to_owned())
+            }
+        }
+
+        let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pool = Arc::new(FundingProbePool {
+            available: HoprBalance::zero(),
+            funded: Arc::clone(&funded),
+        });
+        let cfg = PixStrategyConfig {
+            funding: Some(crate::pix::strategy::PixFundingPolicy {
+                min_available: HoprBalance::new_base(50),
+                top_up: HoprBalance::new_base(10),
+            }),
+            ..Default::default()
+        };
+        let mut strategy = PixStrategyInner::new(pool, Arc::new(NoEvents), cfg, *BOB, None);
+        assert!(
+            crate::strategy::Strategy::run(&mut strategy).await.is_err(),
+            "no subscription, no strategy"
+        );
+
+        // Room for a task spawned before the subscription to have run, had there been one.
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        assert!(
+            funded.lock().is_empty(),
+            "nothing was funded for a strategy that never ran"
+        );
+        Ok(())
     }
 
     /// The policy is the only thing in the strategy that funds, and only when the pool reports

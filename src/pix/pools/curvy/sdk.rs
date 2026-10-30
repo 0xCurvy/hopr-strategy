@@ -166,12 +166,17 @@ pub trait CurvySdkAdapter: Send + Sync + 'static {
     /// cannot shield twice for one failure.
     async fn fund(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error>;
 
-    /// The pool's funding notes, net of allocations, as the pool's own ledger has them.
+    /// What one allocation can draw on from the pool's funding notes, as the pool's own ledger
+    /// has them, net of allocations.
+    ///
+    /// An allocation spends at most [`MAX_ALLOCATION_INPUTS`] notes, so this is the sum of the
+    /// largest ones, not of every note: funding left in many small notes cannot pay one deposit,
+    /// and reporting its total would stop a top-up that is needed.
     ///
     /// A note counts from the moment its shield is journalled, before it is committed and
-    /// spendable; under relayer submission the inputs of an aggregation still count until its
-    /// outcome is observed. What is reported can therefore run ahead of what an allocation can
-    /// draw on right now.
+    /// spendable; under either submission mode the inputs of an aggregation still count until
+    /// its outcome is observed. What is reported can therefore run ahead of what an allocation
+    /// can draw on right now.
     async fn available_balance(&self) -> Result<HoprBalance, Self::Error>;
 
     /// Allocates the given amounts to the given Baby JubJub owners, each discoverable by its scan
@@ -2465,15 +2470,28 @@ where
         // `state.funding` is kept net of allocations: a spent note is replaced by its change as
         // soon as the spend is journalled. It is not filtered by note status — a note shielded a
         // moment ago is listed before it is committed — which is what the trait documents.
-        let total = self.state.lock().funding.iter().try_fold(0_u128, |total, stored| {
-            let note = OwnedNote::try_from(stored)?;
-            let amount: u128 = fr_to_biguint(&note.amount)
-                .try_into()
-                .map_err(|_| RsSdkCurvyAdapterError::InvalidValue("funding amount does not fit u128".to_owned()))?;
-            total
-                .checked_add(amount)
-                .ok_or_else(|| RsSdkCurvyAdapterError::InvalidValue("funding total overflows u128".to_owned()))
-        })?;
+        let mut amounts = self
+            .state
+            .lock()
+            .funding
+            .iter()
+            .map(|stored| {
+                let note = OwnedNote::try_from(stored)?;
+                fr_to_biguint(&note.amount)
+                    .try_into()
+                    .map_err(|_| RsSdkCurvyAdapterError::InvalidValue("funding amount does not fit u128".to_owned()))
+            })
+            .collect::<Result<Vec<u128>, _>>()?;
+        // The largest notes are what `allocate_all` picks when no single note suffices.
+        amounts.sort_unstable_by_key(|amount| std::cmp::Reverse(*amount));
+        let total = amounts
+            .iter()
+            .take(MAX_ALLOCATION_INPUTS)
+            .try_fold(0_u128, |total, amount| {
+                total
+                    .checked_add(*amount)
+                    .ok_or_else(|| RsSdkCurvyAdapterError::InvalidValue("funding total overflows u128".to_owned()))
+            })?;
         Ok(HoprBalance::from(U256::from(total)))
     }
 
@@ -2683,6 +2701,38 @@ mod tests {
     };
 
     type Adapter = RsSdkCurvyAdapter<blokli_client::BlokliClient>;
+
+    /// Funding scattered over more notes than one allocation can spend is not available to it:
+    /// three notes of 40 report 80, what the two largest pay, not 120.
+    #[tokio::test]
+    async fn the_available_balance_is_what_one_allocation_can_draw_on() -> anyhow::Result<()> {
+        let state = RedbCurvyDepositState::in_memory()?;
+        let server = relayer::http_tests::Server::new(|_, _| panic!("no chain access needed")).await;
+        let adapter = test_adapter(&state, server.url.clone())?;
+        let note = |amount: u128| StoredNote {
+            owner_pub: ["1".to_owned(), "2".to_owned()],
+            shared_secret: "3".to_owned(),
+            ephemeral_key: ["4".to_owned(), "5".to_owned()],
+            view_tag: 6,
+            amount: amount.to_string(),
+            token: "7".to_owned(),
+        };
+        let balance = |amount: u128| HoprBalance::from(U256::from(amount));
+
+        adapter.state.lock().funding = vec![note(40), note(40), note(40)];
+        assert_eq!(
+            adapter.available_balance().await?,
+            balance(80),
+            "the two largest of three"
+        );
+
+        adapter.state.lock().funding = vec![note(40), note(100)];
+        assert_eq!(adapter.available_balance().await?, balance(140), "two notes: both");
+
+        adapter.state.lock().funding.clear();
+        assert_eq!(adapter.available_balance().await?, balance(0), "no notes: nothing");
+        Ok(())
+    }
 
     fn test_adapter(state: &RedbCurvyDepositState, url: Url) -> anyhow::Result<Adapter> {
         test_adapter_with_shielder(state, url, None)

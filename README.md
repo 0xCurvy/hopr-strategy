@@ -57,7 +57,8 @@ and a state file that survives restarts. Under `submission: relayer` it also nee
 `pix::pools::curvy` module documentation.
 
 **A pool never funds itself.** The funding gets there through `DepositPool::fund`, called by the strategy when its stanza carries
-a `funding` policy (`top_up` from the Safe whenever `available_balance` drops below `min_available`) or by an operator through
+a `funding` policy (once at startup and before each deposit flush: `top_up` from the Safe when `available_balance` is below
+`min_available`) or by an operator through
 hoprd's API; without either, deposits fail once the pool is empty. The plain pool's funding is the Safe itself and refuses both.
 
 Enabling `strategy-pix` alone gives the engine without a pool, for a consumer supplying its own.

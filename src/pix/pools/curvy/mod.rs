@@ -21,7 +21,7 @@
 //! | event | who | what this pool does |
 //! |---|---|---|
 //! | `DepositDataRequest` | Exit | mints `(K, V)`, **persists the secret**, returns the public half as [`CurvyDepositData`] |
-//! | `NewDepositAddress` | Entry | shields the float from the Safe on first use, then allocates the priced amount to the SSA owner, discoverable by `(K, V)` |
+//! | `NewDepositAddress` | Entry | allocates the priced amount to the SSA owner from the pool's funding, discoverable by `(K, V)` |
 //! | `DepositAddressReceived` | Exit | watches Blokli's note index with `v` until the allocation is committed and final |
 //! | `PrivateKeyRecovered` | Exit | withdraws the committed notes with the reconstructed key, to the Safe |
 //!
@@ -188,6 +188,8 @@ impl crate::pix::DepositAddressOf<PoolKeypair> for DepositAddress {}
 /// localcluster harness builds its PIX stanza from the *plain* pool's config type, so a
 /// Curvy-only YAML key is unreachable from there.
 pub const SHIELDING_ENV: &str = "HOPRD_CURVY_SHIELDING";
+/// Removed with the pool's implicit funding; still looked at so that a leftover value is reported.
+pub const INITIAL_FUNDING_ENV: &str = "HOPRD_CURVY_INITIAL_FUNDING";
 
 /// Environment variable that overrides [`CurvyDepositPoolConfig::submission`].
 ///
@@ -474,6 +476,11 @@ pub struct CurvyDepositPoolConfig {
     #[default(default_safe_multisend_address())]
     #[serde(default = "default_safe_multisend_address")]
     pub safe_multisend_address: Address,
+    /// Removed: the pool never funds itself. Kept so that a leftover setting is reported rather
+    /// than ignored; see [`CurvyDepositPool::new`].
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_funding: Option<HoprBalance>,
 }
 
 // ---------------------------------------------------------------------------
@@ -778,6 +785,21 @@ where
     /// with the node's own key, and the portal path signs with the operator key from the
     /// environment.
     pub fn new(node: Arc<N>, mut cfg: CurvyDepositPoolConfig) -> Result<Self, StrategyError> {
+        // The pool never funds itself any more. Without `deny_unknown_fields` (see the config
+        // docs) a leftover setting would be ignored without a word, and the first deposit would
+        // fail for want of funding with nothing pointing at the setting.
+        if cfg.initial_funding.is_some() {
+            tracing::warn!(
+                "`initial_funding` is no longer read: the pool never funds itself; configure the strategy's `funding` \
+                 policy or fund the pool through the node API"
+            );
+        }
+        if std::env::var_os(INITIAL_FUNDING_ENV).is_some() {
+            tracing::warn!(
+                "{INITIAL_FUNDING_ENV} is no longer read: the pool never funds itself; configure the strategy's \
+                 `funding` policy or fund the pool through the node API"
+            );
+        }
         // Environment overrides are applied before validation, so an override that contradicts
         // the file is caught here rather than at the first deposit.
         if let Ok(raw) = std::env::var(SHIELDING_ENV) {
