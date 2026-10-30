@@ -58,10 +58,12 @@ use curvy_sdk::{
     Account, CurvyClient, Identity, OwnedNote, PreparedDeposit, PreparedDirectShield, Route, ScanRecipient, TxLedger,
     ViewerIdentity,
 };
+use curvy_types::OnchainNote;
 use futures::future::BoxFuture;
 use hopr_api::{
     node::PixAddressId,
     types::{
+        chain::prelude::{CurvyErc777Payload, CurvyNote, Erc777Payload},
         crypto::prelude::{BjjPublicKey, CurvyScanPublicKey},
         primitive::prelude::{Address, BytesRepresentable, HoprBalance, U256},
     },
@@ -110,17 +112,40 @@ pub type PortalFunder = Arc<dyn Fn(Address, HoprBalance) -> BoxFuture<'static, R
 
 /// Performs a direct shield on behalf of the account that holds the float.
 ///
-/// Takes the `directShield` calldata plus the addresses the routed shield needs, and is
-/// responsible for making the call originate from the fund-holding account — the node's Safe.
-/// A callback rather than a method so the pool keeps no chain key of its own and the SDK bridge
-/// stays ignorant of how the Safe is driven.
+/// Takes the shield router's ERC-777 payload plus the router, and is responsible for making the
+/// `send` originate from the fund-holding account — the node's Safe. A callback rather than a
+/// method so the pool keeps no chain key of its own and the SDK bridge stays ignorant of how the
+/// Safe is driven.
 ///
-/// Arguments: the `directShield` calldata, the shield router to `send` it to, the aggregator the
-/// router shields into, and the gross amount.
+/// Arguments: the payload (the aggregator and the note the router shields), the shield router to
+/// `send` it to, and the gross amount.
 ///
-/// `Ok` means the transaction confirmed; the caller still verifies the note on chain.
+/// `Ok` means the transaction confirmed, not that the shield took effect: the Safe reports a
+/// failed inner call without reverting, so the caller still verifies the note on chain.
 pub type DirectShielder =
-    Arc<dyn Fn(Vec<u8>, Address, Address, u128) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
+    Arc<dyn Fn(Erc777Payload, Address, u128) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
+
+/// The shield router's ERC-777 payload for a direct shield: `abi.encode(aggregator, note)`, with
+/// the note as the aggregator's `directShield` takes it, carrying the gross amount.
+fn direct_shield_payload(aggregator: Address, note: &OnchainNote) -> Result<Erc777Payload, RsSdkCurvyAdapterError> {
+    let word = |name: &str, value: &str| {
+        U256::from_dec_str(value).map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("note {name}: {error}")))
+    };
+    Ok(Erc777Payload::Curvy(CurvyErc777Payload::DirectShield {
+        aggregator,
+        note: CurvyNote {
+            owner_hash: word("owner hash", &note.owner_hash)?,
+            token: word("token", &note.token)?,
+            amount: word("amount", &note.amount)?,
+            ephemeral_key: [
+                word("ephemeral key", &note.ephemeral_key[0])?,
+                word("ephemeral key", &note.ephemeral_key[1])?,
+            ],
+            view_tag: u16::try_from(note.view_tag)
+                .map_err(|_| RsSdkCurvyAdapterError::InvalidValue(format!("note view tag: {}", note.view_tag)))?,
+        },
+    }))
+}
 
 /// Curvy chain operations that require SDK knowledge.
 ///
@@ -1069,9 +1094,9 @@ where
                 .aggregator
                 .parse()
                 .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("aggregator address: {error}")))?;
-            let calldata = prepared.calldata()?;
+            let payload = direct_shield_payload(aggregator, &prepared.onchain_note)?;
             tracing::info!(%gross, %router, "shielding the Curvy funding note from the Safe through the shield router");
-            shielder(calldata, router, aggregator, gross)
+            shielder(payload, router, gross)
                 .await
                 .map_err(RsSdkCurvyAdapterError::Funding)?;
         }
@@ -2607,6 +2632,40 @@ fn note_id(note: &OwnedNote) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The payload the chain API encodes is the note as the SDK prepared it, word for word, and
+    /// the same note is what `directShield(note)` would take.
+    #[test]
+    fn the_direct_shield_payload_is_the_sdk_note() -> anyhow::Result<()> {
+        let note = OnchainNote {
+            owner_hash: "1".to_owned(),
+            token: "2".to_owned(),
+            amount: "1000".to_owned(),
+            ephemeral_key: ["4".to_owned(), "5".to_owned()],
+            view_tag: 6,
+        };
+        let aggregator = Address::from([0xcc; 20]);
+        assert_eq!(
+            direct_shield_payload(aggregator, &note)?,
+            Erc777Payload::Curvy(CurvyErc777Payload::DirectShield {
+                aggregator,
+                note: CurvyNote {
+                    owner_hash: 1.into(),
+                    token: 2.into(),
+                    amount: 1000.into(),
+                    ephemeral_key: [4.into(), 5.into()],
+                    view_tag: 6,
+                },
+            })
+        );
+        let mut wide = note.clone();
+        wide.view_tag = u64::from(u16::MAX) + 1;
+        assert!(
+            direct_shield_payload(aggregator, &wide).is_err(),
+            "a view tag wider than uint16 is refused"
+        );
+        Ok(())
+    }
+
     use curvy_core::{field::Fr, witness::Note};
     use hopr_api::{
         ChainKeypair,
@@ -2739,7 +2798,7 @@ mod tests {
             let shielder: DirectShielder = {
                 let landed = landed.clone();
                 let submissions = submissions.clone();
-                Arc::new(move |_, _, _, _| {
+                Arc::new(move |_, _, _| {
                     submissions.fetch_add(1, Ordering::SeqCst);
                     // The transaction confirms either way; only the inner call differs.
                     landed.store(inner_call_succeeds, Ordering::SeqCst);
@@ -4530,7 +4589,7 @@ mod tests {
             let submissions = Arc::new(AtomicUsize::new(0));
             let shielder: DirectShielder = {
                 let submissions = submissions.clone();
-                Arc::new(move |_, _, _, _| {
+                Arc::new(move |_, _, _| {
                     submissions.fetch_add(1, Ordering::SeqCst);
                     Box::pin(async { Ok(()) })
                 })
@@ -4628,7 +4687,7 @@ mod tests {
         let submissions = Arc::new(AtomicUsize::new(0));
         let shielder: DirectShielder = {
             let submissions = submissions.clone();
-            Arc::new(move |_, _, _, _| {
+            Arc::new(move |_, _, _| {
                 submissions.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Ok(()) })
             })
