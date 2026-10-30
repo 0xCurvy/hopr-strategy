@@ -31,6 +31,7 @@ use hopr_api::{
     chain::DepositPool,
     node::{HasChainApi, PixAddressId, PixDepositData},
     types::{
+        chain::prelude::{CurvyErc777Payload, CurvyNote, Erc777Payload},
         crypto::prelude::{BjjKeypair, BjjPublicKey, Bn254Keypair, CurvyScanPublicKey, CurvyScanSecret, Keypair},
         crypto_random::Randomizable,
         internal::prelude::HoprPseudonym,
@@ -824,15 +825,18 @@ async fn test_node() -> anyhow::Result<Arc<ChainNodeOf>> {
     Ok(Arc::new(ChainNode(Arc::new(connector))))
 }
 
-/// `directShield((1, 2, 1000, [4, 5], 6))`, as the SDK prepares it.
-fn direct_shield_calldata() -> Vec<u8> {
-    let mut calldata = vec![0x39, 0xf8, 0xb8, 0x5d];
-    for value in [1u64, 2, 1000, 4, 5, 6] {
-        let mut word = [0u8; 32];
-        word[24..].copy_from_slice(&value.to_be_bytes());
-        calldata.extend_from_slice(&word);
-    }
-    calldata
+/// The direct shield of the note `(1, 2, 1000, [4, 5], 6)` through `aggregator`.
+fn direct_shield_payload(aggregator: Address) -> Erc777Payload {
+    Erc777Payload::Curvy(CurvyErc777Payload::DirectShield {
+        aggregator,
+        note: CurvyNote {
+            owner_hash: 1.into(),
+            token: 2.into(),
+            amount: 1000.into(),
+            ephemeral_key: [4.into(), 5.into()],
+            view_tag: 6,
+        },
+    })
 }
 
 /// A direct shield is one ERC-777 `send` from the node's Safe, made by the node's own chain API:
@@ -869,7 +873,7 @@ async fn a_direct_shield_is_sent_from_the_safe_by_the_node_chain_api() -> anyhow
 
     let gross = 25_u128;
     let shielder = super::safe_direct_shielder(Arc::clone(&api));
-    shielder(direct_shield_calldata(), router, aggregator, gross)
+    shielder(direct_shield_payload(aggregator), router, gross)
         .await
         .map_err(anyhow::Error::msg)?;
 
@@ -888,10 +892,9 @@ async fn a_direct_shield_is_sent_from_the_safe_by_the_node_chain_api() -> anyhow
 }
 
 /// What the chain API is handed is exactly the ERC-777 `send` a direct shield is: the gross
-/// amount, the router as the recipient, and the router's user data wrapping the `directShield`
-/// calldata — not the raw calldata.
+/// amount, the router as the recipient, and the router's payload — the aggregator and the note.
 #[test_log::test(tokio::test)]
-async fn the_direct_shielder_hands_the_router_user_data_to_the_chain_api() -> anyhow::Result<()> {
+async fn the_direct_shielder_hands_the_router_payload_to_the_chain_api() -> anyhow::Result<()> {
     use futures::{FutureExt, future::BoxFuture};
     use hopr_api::types::internal::prelude::Multiaddr;
     use hopr_api::{
@@ -902,8 +905,8 @@ async fn the_direct_shielder_hands_the_router_user_data_to_the_chain_api() -> an
         },
     };
 
-    /// One recorded `send`: the amount, the recipient and the data.
-    type RecordedSend = (HoprBalance, Address, Vec<u8>);
+    /// One recorded `send_erc777`: the amount, the recipient and the payload.
+    type RecordedSend = (HoprBalance, Address, Erc777Payload);
 
     /// Records every `send`; nothing else is part of a direct shield.
     #[derive(Clone, Default)]
@@ -931,13 +934,13 @@ async fn the_direct_shielder_hands_the_router_user_data_to_the_chain_api() -> an
             unreachable!("a direct shield does not withdraw")
         }
 
-        async fn send(
+        async fn send_erc777(
             &self,
             balance: HoprBalance,
             recipient: &Address,
-            data: &[u8],
+            payload: &Erc777Payload,
         ) -> Result<BoxFuture<'life0, Result<ChainReceipt, Self::Error>>, Self::Error> {
-            self.sends.lock().push((balance, *recipient, data.to_vec()));
+            self.sends.lock().push((balance, *recipient, payload.clone()));
             Ok(futures::future::ready(Ok(ChainReceipt::default())).boxed())
         }
 
@@ -964,7 +967,7 @@ async fn the_direct_shielder_hands_the_router_user_data_to_the_chain_api() -> an
     let gross = 25_u128;
 
     let shielder = super::safe_direct_shielder(api.clone());
-    shielder(direct_shield_calldata(), router, aggregator, gross)
+    shielder(direct_shield_payload(aggregator), router, gross)
         .await
         .map_err(anyhow::Error::msg)?;
 
@@ -974,9 +977,9 @@ async fn the_direct_shielder_hands_the_router_user_data_to_the_chain_api() -> an
         vec![(
             HoprBalance::from(U256::from(gross)),
             router,
-            super::module::router_user_data(&aggregator, &direct_shield_calldata())?,
+            direct_shield_payload(aggregator)
         )],
-        "one send: the gross amount to the router, carrying the router's user data"
+        "one send: the gross amount to the router, carrying the router's payload"
     );
     Ok(())
 }

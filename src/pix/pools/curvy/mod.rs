@@ -105,7 +105,6 @@
 mod detect;
 pub mod indexer;
 mod lifecycle;
-mod module;
 pub mod relayer;
 mod sdk;
 mod state;
@@ -123,6 +122,7 @@ use hopr_api::{
     chain::{BatchOutcomes, ChainWriteAccountOperations, DepositNotification, DepositPool},
     node::{HasChainApi, PixAddressId, PixDepositData},
     types::{
+        chain::prelude::Erc777Payload,
         crypto::prelude::{
             BjjKeypair, BjjPublicKey, Bn254Keypair, CURVY_SCAN_PUBLIC_KEY_SIZE, CurvyScanPublicKey, CurvyScanSecret,
             Keypair,
@@ -651,28 +651,25 @@ impl From<CurvyDepositPoolError> for StrategyError {
 /// in one atomic call. Routing it through an EOA first would work equally well on chain and would
 /// put the node's whole PIX budget behind a hot key.
 ///
-/// [`ChainWriteAccountOperations::send`] settles through the Safe module like
+/// [`ChainWriteAccountOperations::send_erc777`] settles through the Safe module like
 /// [`withdraw`](ChainWriteAccountOperations::withdraw) does for [`safe_funder`], so the shield goes
 /// through the node's own transaction sequencer.
 fn safe_direct_shielder<Api>(api: Api) -> DirectShielder
 where
     Api: ChainWriteAccountOperations + Clone + Send + Sync + 'static,
 {
-    Arc::new(
-        move |calldata: Vec<u8>, router: Address, aggregator: Address, gross: u128| {
-            let api = api.clone();
-            Box::pin(async move {
-                let user_data = module::router_user_data(&aggregator, &calldata).map_err(|error| error.to_string())?;
-                let pending = api
-                    .send(HoprBalance::from(U256::from(gross)), &router, &user_data)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let tx = pending.await.map_err(|error| error.to_string())?;
-                tracing::info!(%tx, %router, gross, "the direct shield confirmed on chain");
-                Ok(())
-            }) as BoxFuture<'static, Result<(), String>>
-        },
-    )
+    Arc::new(move |payload: Erc777Payload, router: Address, gross: u128| {
+        let api = api.clone();
+        Box::pin(async move {
+            let pending = api
+                .send_erc777(HoprBalance::from(U256::from(gross)), &router, &payload)
+                .await
+                .map_err(|error| error.to_string())?;
+            let tx = pending.await.map_err(|error| error.to_string())?;
+            tracing::info!(%tx, %router, gross, "the direct shield confirmed on chain");
+            Ok(())
+        }) as BoxFuture<'static, Result<(), String>>
+    })
 }
 
 /// How long a single relayer HTTP request may take.
