@@ -355,6 +355,19 @@ fn journal_portal_funded(
     store.save(&state)
 }
 
+/// Records that the portal deployment `tx` confirmed.
+fn journal_portal_deployed(
+    state: &parking_lot::Mutex<SdkState>,
+    store: &RedbCurvySdkStore,
+    tx: &str,
+) -> Result<(), RsSdkCurvyAdapterError> {
+    let mut state = state.lock();
+    if let Some(in_flight) = state.shield_in_flight.as_mut() {
+        in_flight.deployed = Some(tx.to_owned());
+    }
+    store.save(&state)
+}
+
 /// The shield router's ERC-777 payload for a direct shield: `abi.encode(aggregator, note)`, with
 /// the note as the aggregator's `directShield` takes it, carrying the gross amount.
 fn direct_shield_payload(aggregator: Address, note: &OnchainNote) -> Result<Erc777Payload, RsSdkCurvyAdapterError> {
@@ -928,6 +941,10 @@ struct StoredShield {
     /// As [`StoredDirectShield::from_block`].
     #[serde(default)]
     from_block: Option<u64>,
+    /// The portal deployment's transaction once it confirmed. From then on the note is only looked
+    /// for: deploying the same portal again reverts.
+    #[serde(default)]
+    deployed: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1802,15 +1819,31 @@ where
     ) -> Result<(), RsSdkCurvyAdapterError> {
         let mut state = self.state.lock();
         let mut booked = SdkState::clone(&state);
-        let funding_ids = booked
+        let funding_nullifiers = booked
             .funding
             .iter()
             .map(OwnedNote::try_from)
             .collect::<Result<Vec<_>, _>>()?
             .iter()
-            .map(note_id)
+            .map(OwnedNote::nullifier)
             .collect::<Vec<_>>();
-        for shield in landed {
+        // Every fee variant of one note has the same nullifier, so only one of them can be spent:
+        // a committed one first, then the largest, is booked.
+        if let Some(shield) = landed
+            .iter()
+            .max_by_key(|shield| (shield.status == 2, shield.note.amount))
+        {
+            for other in landed
+                .iter()
+                .filter(|other| note_id(&other.note) != note_id(&shield.note))
+            {
+                tracing::warn!(
+                    booked = %note_id(&shield.note),
+                    unspendable = %note_id(&other.note),
+                    amount = %fr_to_dec(&other.note.amount),
+                    "the Curvy funding note landed more than once under different fees; the variants share one nullifier, so only the booked one can be spent"
+                );
+            }
             if shield.note.amount != prepared.amount {
                 tracing::info!(
                     prepared = %fr_to_dec(&prepared.amount),
@@ -1819,7 +1852,7 @@ where
                 );
             }
             let stored = StoredNote::from(&shield.note);
-            if !funding_ids.contains(&note_id(&shield.note)) {
+            if !funding_nullifiers.contains(&shield.note.nullifier()) {
                 booked.funding.push(stored.clone());
             }
             if shield.status != 2 && !booked.pending.iter().any(|pending| pending == &stored) {
@@ -1972,6 +2005,7 @@ where
                 stage: StoredShieldStage::Prepared,
                 submission: ShieldSubmission::NotSubmitted,
                 from_block,
+                deployed: None,
             };
             let mut state = self.state.lock();
             state.shield_in_flight = Some(shield.clone());
@@ -1984,6 +2018,29 @@ where
         let mut landed =
             Self::landed_shield(client, &prepared.note, gross, ShieldKind::Portal, shield.from_block).await?;
         let mut ledger = Vec::new();
+        if let Some(tx) = shield.deployed.clone().filter(|_| landed.is_empty()) {
+            let unindexed = || RsSdkCurvyAdapterError::ShieldConfirmedUnindexed {
+                note: note_id(&prepared.note),
+                gross,
+                tx: tx.clone(),
+                resend_after: None,
+            };
+            // A retry within a funding only looks, and the read above was its look.
+            if resend == ShieldResend::ObserveOnly {
+                return Err(unindexed());
+            }
+            landed = self
+                .observe_landed_shield(
+                    client,
+                    &prepared.note,
+                    gross,
+                    ShieldKind::Portal,
+                    shield.from_block,
+                    true,
+                )
+                .await?
+                .ok_or_else(unindexed)?;
+        }
         if landed.is_empty() {
             if shield.stage == StoredShieldStage::Prepared {
                 let portal_balance = client
@@ -2137,8 +2194,7 @@ where
             tracing::info!(tx = %entry.tx_hash, backend = %entry.backend, "shielded the Curvy funding note");
             let tx = entry.tx_hash.clone();
             ledger.push(entry);
-            // The journal stays at `Funded` until the note shows, so the next funding looks for it
-            // before it deploys the portal again.
+            journal_portal_deployed(&self.state, &self.store, &tx)?;
             landed = self
                 .observe_landed_shield(
                     client,
@@ -7188,6 +7244,7 @@ mod tests {
             stage: StoredShieldStage::Funded,
             submission: ShieldSubmission::NotSubmitted,
             from_block: None,
+            deployed: None,
         });
         store.save(&persisted)?;
         let server = relayer::http_tests::Server::new(|path, body| {
@@ -7249,6 +7306,7 @@ mod tests {
             stage,
             submission,
             from_block: None,
+            deployed: None,
         });
         store.save(&persisted)?;
         let portal_balance = Arc::new(AtomicU64::new(0));
@@ -7657,6 +7715,8 @@ mod tests {
         known: parking_lot::Mutex<Vec<String>>,
         pending: parking_lot::Mutex<Vec<serde_json::Value>>,
         searched_from: parking_lot::Mutex<Vec<String>>,
+        /// Transactions the operator submitted, each confirmed.
+        submitted: std::sync::atomic::AtomicUsize,
     }
 
     impl ShieldChain {
@@ -7668,6 +7728,7 @@ mod tests {
                 known: Default::default(),
                 pending: Default::default(),
                 searched_from: Default::default(),
+                submitted: Default::default(),
             })
         }
 
@@ -7716,6 +7777,32 @@ mod tests {
                             "pendingNoteCommitment": self.commitment_fee.lock().to_string(),
                             "withdrawal": "0",
                         }
+                    }}}),
+                ));
+            }
+            if query.contains("transactionCount") {
+                return Some((
+                    200,
+                    serde_json::json!({"data":{"transactionCount":{"__typename":"TransactionCount","count":0}}}),
+                ));
+            }
+            if query.contains("gasPrice") {
+                return Some((
+                    200,
+                    serde_json::json!({"data":{"chainInfo":{"__typename":"ChainInfo","chainId":100,"gasPrice":"1"}}}),
+                ));
+            }
+            if query.contains("sendTransactionSync") {
+                self.submitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let raw = variables["raw"].as_str().unwrap();
+                let raw = const_hex::decode(raw.trim_start_matches("0x")).unwrap();
+                let hash = hopr_api::types::crypto::types::Hash::create(&[raw.as_slice()]);
+                return Some((
+                    200,
+                    serde_json::json!({"data":{"sendTransactionSync":{
+                        "__typename":"Transaction","id":"1","status":"CONFIRMED",
+                        "transactionHash":format!("0x{}", const_hex::encode(hash.as_ref())),
+                        "submittedAt":"2026-11-16T00:00:00Z"
                     }}}),
                 ));
             }
@@ -7865,6 +7952,121 @@ mod tests {
             ["0"],
             "a legacy journal searches from genesis"
         );
+        Ok(())
+    }
+
+    /// A note that landed twice, under two fees. Its variants share one nullifier, so only one of
+    /// them can be spent, and only that one is booked: a committed one, the larger.
+    #[tokio::test]
+    async fn fee_variants_of_one_note_are_booked_once() -> anyhow::Result<()> {
+        let state = RedbCurvyDepositState::in_memory()?;
+        let journalled = OwnedNote {
+            amount: Fr::from(990_u64),
+            ..Adapter::owned_note(&fixture(7))?
+        };
+        let variant = OwnedNote {
+            amount: Fr::from(987_u64),
+            ..journalled.clone()
+        };
+        assert_eq!(journalled.nullifier(), variant.nullifier());
+        journal_direct_shield_with(&state, &journalled, serde_json::json!({ "gross": "1000" }))?;
+        let chain = ShieldChain::new(1, 20, 60);
+        chain.know(&journalled);
+        chain.know(&variant);
+        chain.index(&variant, 50);
+        let server = chain.serve().await;
+        let (shielder, submissions) = counting_shielder();
+        let adapter = test_adapter_with_shielder(&state, server.url.clone(), Some(shielder))?;
+
+        adapter
+            .fund(
+                HoprBalance::from(U256::from(1_000_u32)),
+                Address::from([9_u8; 20]),
+                ShieldResend::AfterGrace,
+            )
+            .await?;
+        let stored = adapter.store.load()?;
+        assert_eq!(stored.funding, vec![StoredNote::from(&journalled)]);
+        assert_eq!(
+            adapter.available_balance().await?,
+            HoprBalance::from(U256::from(990_u32))
+        );
+        assert!(stored.direct_shield_in_flight.is_none());
+        assert_eq!(submissions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// A confirmed portal deployment is journalled before its note is looked for. Until the note
+    /// shows, no funding and no retry within one deploys the same portal again.
+    #[tokio::test]
+    async fn a_confirmed_portal_deployment_is_never_sent_again() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let note = Adapter::owned_note(&fixture(7))?;
+        let store = RedbCurvySdkStore::new(&state)?;
+        let mut persisted = store.load()?;
+        persisted.shield_in_flight = Some(StoredShield {
+            note: StoredNote::from(&note),
+            gross: "7".to_owned(),
+            recovery: format!("0x{}", "aa".repeat(20)),
+            portal_address: format!("0x{}", "bb".repeat(20)),
+            stage: StoredShieldStage::Funded,
+            submission: ShieldSubmission::Submitted {
+                tx: confirmed_shield().tx,
+                at: Some(0),
+            },
+            from_block: Some(60),
+            deployed: None,
+        });
+        store.save(&persisted)?;
+        let chain = ShieldChain::new(1, 0, 60);
+        let server = chain.serve().await;
+        let mut adapter = operator_adapter(&state, server.url.clone())?;
+        adapter.config.shielding = CurvyShielding::Portal;
+
+        for resend in [
+            ShieldResend::AfterGrace,
+            ShieldResend::AfterGrace,
+            ShieldResend::ObserveOnly,
+        ] {
+            let error = adapter
+                .fund(
+                    HoprBalance::from(U256::from(7_u8)),
+                    Address::from([0xaa_u8; 20]),
+                    resend,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    RsSdkCurvyAdapterError::ShieldConfirmedUnindexed { resend_after: None, .. }
+                ),
+                "{resend:?}: {error}"
+            );
+            assert_eq!(chain.submitted.load(Ordering::SeqCst), 1, "deployed once: {resend:?}");
+        }
+        assert!(
+            store
+                .load()?
+                .shield_in_flight
+                .and_then(|shield| shield.deployed)
+                .is_some(),
+            "the deployment is journalled"
+        );
+
+        chain.know(&note);
+        adapter
+            .fund(
+                HoprBalance::from(U256::from(7_u8)),
+                Address::from([0xaa_u8; 20]),
+                ShieldResend::AfterGrace,
+            )
+            .await?;
+        let stored = store.load()?;
+        assert_eq!(stored.funding, vec![StoredNote::from(&note)]);
+        assert!(stored.shield_in_flight.is_none(), "the journal is settled");
+        assert_eq!(chain.submitted.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
