@@ -55,8 +55,8 @@ use curvy_core::{
     stealth,
 };
 use curvy_sdk::{
-    Account, CircuitFamily, CircuitRef, CurvyClient, Identity, OwnedNote, PreparedDeposit, PreparedDirectShield, Route,
-    ScanRecipient, TxLedger, ViewerIdentity,
+    Account, CircuitFamily, CircuitRef, CurvyClient, Identity, LandedShield, OwnedNote, PreparedDeposit,
+    PreparedDirectShield, Route, ScanRecipient, ShieldKind, TxLedger, ViewerIdentity,
 };
 use curvy_types::OnchainNote;
 use futures::future::BoxFuture;
@@ -93,9 +93,9 @@ const MAX_COMMITMENTS_PER_PROOF: usize = curvy_sdk::MAX_COMMIT_NOTES;
 const MAX_WITHDRAWAL_INPUTS: usize = 10;
 /// An aggregation spends one or two committed input notes.
 const MAX_ALLOCATION_INPUTS: usize = 2;
-/// How many times, and how far apart, to look for a confirmed direct shield's note.
-const DIRECT_SHIELD_OBSERVATIONS: usize = 3;
-const DIRECT_SHIELD_OBSERVATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// How many times, and how far apart, to look for a confirmed shield's note.
+const SHIELD_OBSERVATIONS: usize = 3;
+const SHIELD_OBSERVATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// Search budget for an exact whole-note withdrawal; see `select_notes`.
 /// The default of `CurvyDepositPoolConfig::direct_shield_settle_grace`: three minutes, the
 /// operator's allowance for Gnosis finality; see there for the trade-off.
@@ -864,8 +864,8 @@ struct RelayAggregationOutcome {
 ///
 /// Fewer stages than [`StoredShield`]: nothing is funded ahead of time, so there is no
 /// funded-but-not-shielded window to resume from. The record exists so that a crash between
-/// submitting and observing the note does not shield twice — the note id is checked against the
-/// chain before a resubmission.
+/// submitting and observing the note does not shield twice — the chain is searched for the note,
+/// at any amount the vault's fees gave it, before a resubmission.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredDirectShield {
     note: StoredNote,
@@ -873,6 +873,10 @@ struct StoredDirectShield {
     /// How far the Safe's transaction got; see [`ShieldSubmission`].
     #[serde(default)]
     submission: ShieldSubmission,
+    /// The note index's head when the shield was journalled: no earlier block can hold its note.
+    /// `None`, also for a journal without the field, searches the whole index.
+    #[serde(default)]
+    from_block: Option<u64>,
 }
 
 /// What the journal knows of the Safe's transaction for a direct shield in flight.
@@ -921,6 +925,9 @@ struct StoredShield {
     /// place of "the aggregator knows the note".
     #[serde(default)]
     submission: ShieldSubmission,
+    /// As [`StoredDirectShield::from_block`].
+    #[serde(default)]
+    from_block: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1574,7 +1581,7 @@ where
         // crash followed by a change of the configured top-up.
         let mut router: Option<Address> = None;
         let in_flight = self.state.lock().direct_shield_in_flight.clone();
-        let (gross, prepared, submission) = match in_flight {
+        let (gross, prepared, submission, from_block) = match in_flight {
             Some(stored) => {
                 let journalled = stored.gross.parse::<u128>().map_err(|error| {
                     RsSdkCurvyAdapterError::InvalidValue(format!("journalled direct shield amount: {error}"))
@@ -1591,10 +1598,12 @@ where
                     journalled,
                     PreparedDirectShield::from_recovery_parts(note, journalled),
                     stored.submission,
+                    stored.from_block,
                 )
             }
             None => {
                 router = Some(self.shield_router_checked(endpoints).await?);
+                let from_block = Self::shield_search_start(client).await;
                 let prepared = client
                     .prepare_direct_shield(&self.spender, requested, self.token().await?)
                     .await?;
@@ -1603,9 +1612,10 @@ where
                     note: StoredNote::from(&prepared.note),
                     gross: requested.to_string(),
                     submission: ShieldSubmission::NotSubmitted,
+                    from_block,
                 });
                 self.store.save(&state)?;
-                (requested, prepared, ShieldSubmission::NotSubmitted)
+                (requested, prepared, ShieldSubmission::NotSubmitted, from_block)
             }
         };
 
@@ -1614,10 +1624,11 @@ where
         // allocation could select a note that is not committed yet.
         let mut held = Some(chain);
 
-        // A note the aggregator already knows was shielded by an earlier attempt whose outcome we
-        // lost. Shielding again would spend the float twice.
-        let first = client.note_status(&prepared.note.note_id()).await?;
-        let mut observed = Some(first).filter(|status| matches!(status, 1 | 2));
+        // A note the aggregator already holds was shielded by an earlier attempt whose outcome was
+        // not recorded. Shielding again would spend the float twice. It may hold it at another
+        // amount: see `landed_shield`.
+        let first = Self::landed_shield(client, &prepared.note, gross, ShieldKind::Direct, from_block).await?;
+        let mut observed = Some(first).filter(|landed| !landed.is_empty());
         if observed.is_none() {
             match &submission {
                 ShieldSubmission::NotSubmitted => {}
@@ -1677,7 +1688,9 @@ where
                             resend_after: since.map(|since| since.saturating_add(grace)),
                         });
                     }
-                    observed = self.observe_direct_shield(client, &prepared.note, true).await?;
+                    observed = self
+                        .observe_landed_shield(client, &prepared.note, gross, ShieldKind::Direct, from_block, true)
+                        .await?;
                     if observed.is_none() {
                         match since {
                             Some(since) => tracing::warn!(
@@ -1727,7 +1740,10 @@ where
                 match outcome {
                     Ok(confirmed) => {
                         tracing::info!(tx = %confirmed.tx, "the direct shield confirmed on chain");
-                        match self.observe_direct_shield(client, &prepared.note, false).await? {
+                        match self
+                            .observe_landed_shield(client, &prepared.note, gross, ShieldKind::Direct, from_block, false)
+                            .await?
+                        {
                             Some(observed) => observed,
                             // Confirmed is journalled `Submitted` and stays so: the aggregator is
                             // behind, and the next funding reads again.
@@ -1760,7 +1776,7 @@ where
         };
 
         let _chain = held;
-        self.book_shield(&prepared.note, observed, ShieldJournal::Direct)?;
+        self.book_shield(&prepared.note, &observed, ShieldJournal::Direct)?;
         // As in `shield`: journalled is funded, and committing is retried by every reconciliation.
         match self.recover_pending().await {
             Ok(ledger) => Ok(ledger),
@@ -1771,30 +1787,44 @@ where
         }
     }
 
-    /// Books a shield's note as funding, and as pending while it is not committed, and clears the
-    /// shield in flight, in one durable write.
+    /// Books the notes a shield of `prepared` landed as funding, and as pending while they are not
+    /// committed, and clears the shield in flight, in one durable write.
     ///
     /// Built on a copy and made live only once that copy is saved. A save that fails leaves the
     /// shield in flight, in memory as on disk, so that a retry resumes it, finds its note and books
     /// it. Booked in memory first, the retry would find nothing in flight and, since `fund` adds
     /// funding, shield a second time for the one failure.
-    fn book_shield(&self, note: &OwnedNote, status: u8, journal: ShieldJournal) -> Result<(), RsSdkCurvyAdapterError> {
+    fn book_shield(
+        &self,
+        prepared: &OwnedNote,
+        landed: &[LandedShield],
+        journal: ShieldJournal,
+    ) -> Result<(), RsSdkCurvyAdapterError> {
         let mut state = self.state.lock();
         let mut booked = SdkState::clone(&state);
-        let stored = StoredNote::from(note);
-        let id = note_id(note);
-        let already_funding = booked
+        let funding_ids = booked
             .funding
             .iter()
             .map(OwnedNote::try_from)
             .collect::<Result<Vec<_>, _>>()?
             .iter()
-            .any(|funding| note_id(funding) == id);
-        if !already_funding {
-            booked.funding.push(stored.clone());
-        }
-        if status != 2 && !booked.pending.iter().any(|pending| pending == &stored) {
-            booked.pending.push(stored);
+            .map(note_id)
+            .collect::<Vec<_>>();
+        for shield in landed {
+            if shield.note.amount != prepared.amount {
+                tracing::info!(
+                    prepared = %fr_to_dec(&prepared.amount),
+                    landed = %fr_to_dec(&shield.note.amount),
+                    "the Curvy funding note landed with the net amount the vault's fees gave when the shield executed"
+                );
+            }
+            let stored = StoredNote::from(&shield.note);
+            if !funding_ids.contains(&note_id(&shield.note)) {
+                booked.funding.push(stored.clone());
+            }
+            if shield.status != 2 && !booked.pending.iter().any(|pending| pending == &stored) {
+                booked.pending.push(stored);
+            }
         }
         match journal {
             ShieldJournal::Direct => booked.direct_shield_in_flight = None,
@@ -1842,28 +1872,61 @@ where
         Ok(())
     }
 
-    /// The note's status once a direct shield has confirmed, or `None` if the aggregator still
-    /// does not know it after a few reads. `first_read_missed` carries a read the caller already
-    /// made and missed with, so that it is not made twice.
+    /// What a shield of `note` landed once its transaction has confirmed, or `None` if no version
+    /// of the note has shown after a few reads. `first_read_missed` carries a read the caller
+    /// already made and missed with, so that it is not made twice.
     ///
-    /// The aggregator is asked a few times, so that nothing is recorded as funding on the strength
-    /// of a receipt alone, and since its index may be a block behind the chain.
-    async fn observe_direct_shield(
+    /// The chain is read a few times, so that nothing is recorded as funding on the strength of a
+    /// receipt alone, and since the aggregator's index may be a block behind the chain.
+    async fn observe_landed_shield(
         &self,
         client: &CurvyClient,
         note: &OwnedNote,
+        gross: u128,
+        kind: ShieldKind,
+        from_block: Option<u64>,
         first_read_missed: bool,
-    ) -> Result<Option<u8>, RsSdkCurvyAdapterError> {
-        for attempt in usize::from(first_read_missed)..DIRECT_SHIELD_OBSERVATIONS {
+    ) -> Result<Option<Vec<LandedShield>>, RsSdkCurvyAdapterError> {
+        for attempt in usize::from(first_read_missed)..SHIELD_OBSERVATIONS {
             if attempt > 0 {
-                tokio::time::sleep(DIRECT_SHIELD_OBSERVATION_INTERVAL).await;
+                tokio::time::sleep(SHIELD_OBSERVATION_INTERVAL).await;
             }
-            let status = client.note_status(&note.note_id()).await?;
-            if matches!(status, 1 | 2) {
-                return Ok(Some(status));
+            let landed = Self::landed_shield(client, note, gross, kind, from_block).await?;
+            if !landed.is_empty() {
+                return Ok(Some(landed));
             }
         }
         Ok(None)
+    }
+
+    /// Every note a shield of `note` landed. The vault charges the fees in force when the shield
+    /// executes, so a fee update after `note` was prepared lands it at another amount, under
+    /// another id. See [`CurvyClient::landed_shield_notes`].
+    ///
+    /// A journal without a starting block searches the whole index.
+    async fn landed_shield(
+        client: &CurvyClient,
+        note: &OwnedNote,
+        gross: u128,
+        kind: ShieldKind,
+        from_block: Option<u64>,
+    ) -> Result<Vec<LandedShield>, RsSdkCurvyAdapterError> {
+        client
+            .landed_shield_notes(note, gross, kind, from_block.unwrap_or(0))
+            .await
+            .map_err(RsSdkCurvyAdapterError::from)
+    }
+
+    /// The note index's head, as the earliest block a shield about to be journalled could land in.
+    /// An index that cannot say leaves the whole history to search.
+    async fn shield_search_start(client: &CurvyClient) -> Option<u64> {
+        match client.notes.head_block().await {
+            Ok(head) => Some(head),
+            Err(error) => {
+                tracing::warn!(%error, "no Curvy index head to journal; the shield's note will be searched for from genesis");
+                None
+            }
+        }
     }
 
     /// Shields `gross` into the pool as one more funding note. A journalled shield is resumed
@@ -1897,6 +1960,7 @@ where
             }
             shield
         } else {
+            let from_block = Self::shield_search_start(client).await;
             let prepared = client
                 .prepare_deposit(&self.spender, gross, self.token().await?, recovery_address)
                 .await?;
@@ -1907,6 +1971,7 @@ where
                 portal_address: prepared.portal_address,
                 stage: StoredShieldStage::Prepared,
                 submission: ShieldSubmission::NotSubmitted,
+                from_block,
             };
             let mut state = self.state.lock();
             state.shield_in_flight = Some(shield.clone());
@@ -1916,9 +1981,10 @@ where
         let prepared = shield.prepared()?;
         // From here on the journalled amount, which is `gross` unless the shield was resumed.
         let gross = prepared.gross;
-        let observed_status = client.note_status(&prepared.note.note_id()).await?;
+        let mut landed =
+            Self::landed_shield(client, &prepared.note, gross, ShieldKind::Portal, shield.from_block).await?;
         let mut ledger = Vec::new();
-        if !matches!(observed_status, 1 | 2) {
+        if landed.is_empty() {
             if shield.stage == StoredShieldStage::Prepared {
                 let portal_balance = client
                     .erc20_balance(&endpoints.token_address, &prepared.portal_address)
@@ -2069,10 +2135,29 @@ where
                 .shield_prepared_deposit(&prepared, &self.config.operator_private_key, self.config.route)
                 .await?;
             tracing::info!(tx = %entry.tx_hash, backend = %entry.backend, "shielded the Curvy funding note");
+            let tx = entry.tx_hash.clone();
             ledger.push(entry);
+            // The journal stays at `Funded` until the note shows, so the next funding looks for it
+            // before it deploys the portal again.
+            landed = self
+                .observe_landed_shield(
+                    client,
+                    &prepared.note,
+                    gross,
+                    ShieldKind::Portal,
+                    shield.from_block,
+                    false,
+                )
+                .await?
+                .ok_or_else(|| RsSdkCurvyAdapterError::ShieldConfirmedUnindexed {
+                    note: note_id(&prepared.note),
+                    gross,
+                    tx,
+                    resend_after: None,
+                })?;
         }
         let _chain = held;
-        self.book_shield(&prepared.note, observed_status, ShieldJournal::Portal)?;
+        self.book_shield(&prepared.note, &landed, ShieldJournal::Portal)?;
         // The note is journalled: the shield is done whatever happens to committing it, and a
         // retry of `fund` on this error would shield a second time. Every reconciliation retries
         // the commitment instead.
@@ -3763,22 +3848,31 @@ mod tests {
                 note: StoredNote::from(&note),
                 gross: "7".to_owned(),
                 submission: ShieldSubmission::NotSubmitted,
+                from_block: None,
             });
             store.save(&persisted)?;
 
             let landed = Arc::new(AtomicBool::new(false));
             let submissions = Arc::new(AtomicUsize::new(0));
             let last_gross = Arc::new(AtomicU64::new(0));
+            // Only the journalled notes land: a lookup also asks for the note at today's fees.
+            let journalled = [note_id(&note), note_id(&Adapter::owned_note(&fixture(8))?)];
             let server = relayer::http_tests::Server::new({
                 let landed = landed.clone();
                 move |path, body| {
                     assert_eq!(path, "/graphql");
                     let query = body["query"].as_str().unwrap();
+                    if let Some(response) = feeless_empty_index_response(query) {
+                        return Some(response);
+                    }
                     if query.contains("curvyVaultToken") {
                         return Some(vault_token_response(&"03".repeat(20)));
                     }
                     assert!(query.contains("curvyNoteStatus"));
-                    Some(note_status_response(landed.load(Ordering::SeqCst)))
+                    let id = body["variables"]["noteId"].as_str().unwrap().to_ascii_lowercase();
+                    Some(note_status_response(
+                        landed.load(Ordering::SeqCst) && journalled.contains(&id),
+                    ))
                 }
             })
             .await;
@@ -3816,6 +3910,7 @@ mod tests {
                     note: StoredNote::from(&second),
                     gross: "7".to_owned(),
                     submission: ShieldSubmission::NotSubmitted,
+                    from_block: None,
                 });
                 store.save(&persisted)?;
                 landed.store(false, Ordering::SeqCst);
@@ -6507,15 +6602,19 @@ mod tests {
             note: StoredNote::from(&note),
             gross: "7".to_owned(),
             submission: ShieldSubmission::NotSubmitted,
+            from_block: None,
         });
         store.save(&persisted)?;
 
         let server = relayer::http_tests::Server::new(move |path, body| {
             assert_eq!(path, "/graphql");
             let query = body["query"].as_str().unwrap();
+            if let Some(response) = feeless_empty_index_response(query) {
+                return Some(response);
+            }
             assert!(
                 query.contains("curvyNoteStatus"),
-                "only the note's status is needed to record a landed shield, not {query}"
+                "only the chain's notes are needed to record a landed shield, not {query}"
             );
             Some(note_status_response(true))
         })
@@ -6583,6 +6682,9 @@ mod tests {
                 if query.contains("curvyVaultToken") {
                     return Some(vault_token_response(&"03".repeat(20)));
                 }
+                if let Some(response) = feeless_empty_index_response(query) {
+                    return Some(response);
+                }
                 assert!(query.contains("curvyNoteStatus"), "{query}");
                 Some(note_status_response(landed.load(Ordering::SeqCst)))
             }
@@ -6625,6 +6727,9 @@ mod tests {
         relayer::http_tests::Server::new(move |path, body| {
             assert_eq!(path, "/graphql");
             let query = body["query"].as_str().unwrap();
+            if let Some(response) = feeless_empty_index_response(query) {
+                return Some(response);
+            }
             if query.contains("curvyVaultToken") {
                 return Some(vault_token_response(&"03".repeat(20)));
             }
@@ -6799,7 +6904,7 @@ mod tests {
 
     /// A transaction with no answer may still land: it is waited for through its grace, looked for
     /// on every funding, and only sent again after it.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn an_unconfirmed_direct_shield_settles_before_it_is_sent_again() -> anyhow::Result<()> {
         let rig = shield_rig(
             "7",
@@ -6892,7 +6997,7 @@ mod tests {
     /// note: it is read once per funding, and the shield settles when the aggregator catches up.
     /// Past the grace the note's absence is taken for a failed inner call of the Safe, and it is
     /// sent again.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_confirmed_direct_shield_with_no_note_is_not_resent_within_its_grace() -> anyhow::Result<()> {
         let tx = confirmed_shield().tx;
         let at = Some(unix_now().unwrap());
@@ -6932,7 +7037,7 @@ mod tests {
 
     /// Past the grace — or with no time recorded — a confirmed shield whose note never appeared is
     /// treated as a failed inner call, and sent again.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_confirmed_direct_shield_with_no_note_is_resent_after_its_grace() -> anyhow::Result<()> {
         for at in [Some(unix_now().unwrap() - 3600), None] {
             let rig = shield_rig(
@@ -7011,7 +7116,7 @@ mod tests {
 
     /// A journal from before the submission was recorded reads as unknown, with no time: the chain
     /// is looked at first, and the Safe sends only if the note is not there.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_legacy_direct_shield_journal_is_looked_for_before_it_is_sent() -> anyhow::Result<()> {
         for note_is_there in [true, false] {
             let rig = shield_rig("7", None, note_is_there, vec![]).await?;
@@ -7036,7 +7141,7 @@ mod tests {
     /// A retry within one funding only looks for a direct shield, however far past its grace it
     /// is: it never sends again, and leaves the journal as it was for the next funding, whose first
     /// attempt decides.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn an_observe_only_attempt_never_sends_a_direct_shield_again() -> anyhow::Result<()> {
         let past = Some(unix_now().unwrap() - 3600);
         for submission in [
@@ -7082,11 +7187,16 @@ mod tests {
             portal_address: format!("0x{}", "bb".repeat(20)),
             stage: StoredShieldStage::Funded,
             submission: ShieldSubmission::NotSubmitted,
+            from_block: None,
         });
         store.save(&persisted)?;
         let server = relayer::http_tests::Server::new(|path, body| {
             assert_eq!(path, "/graphql");
-            assert!(body["query"].as_str().unwrap().contains("curvyNoteStatus"));
+            let query = body["query"].as_str().unwrap();
+            if let Some(response) = feeless_empty_index_response(query) {
+                return Some(response);
+            }
+            assert!(query.contains("curvyNoteStatus"), "{query}");
             Some(note_status_response(true))
         })
         .await;
@@ -7138,6 +7248,7 @@ mod tests {
             portal_address: format!("0x{}", "bb".repeat(20)),
             stage,
             submission,
+            from_block: None,
         });
         store.save(&persisted)?;
         let portal_balance = Arc::new(AtomicU64::new(0));
@@ -7160,6 +7271,9 @@ mod tests {
                         },
                     }}),
                 ));
+            }
+            if let Some(response) = feeless_empty_index_response(query) {
+                return Some(response);
             }
             assert!(query.contains("curvyNoteStatus"), "{query}");
             Some(note_status_response(false))
@@ -7486,6 +7600,339 @@ mod tests {
         assert!(
             matches!(submission_of(&rig)?, Some(ShieldSubmission::Submitted { .. })),
             "the journal is kept as it was"
+        );
+        Ok(())
+    }
+
+    /// A shield lookup's reads besides note statuses, for fakes that answer only those: no fees,
+    /// and an index at block 0 that holds nothing. Ask it before matching `curvyVaultToken`, which
+    /// the fee query's `curvyVaultTokenCount` also contains.
+    fn feeless_empty_index_response(query: &str) -> Option<(u16, serde_json::Value)> {
+        if query.contains("curvyVaultFees") {
+            Some(shield_fees_response(0))
+        } else if query.contains("chainInfo") {
+            Some(chain_info_response(0))
+        } else if query.contains("curvyPendingNotes") {
+            Some((
+                200,
+                serde_json::json!({"data":{"curvyPendingNotes":{"__typename":"CurvyPendingNotes","notes":[]}}}),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// The vault's fees with `tokens` tokens registered and no deposit fee.
+    fn shield_fees_response(tokens: u64) -> (u16, serde_json::Value) {
+        (
+            200,
+            serde_json::json!({ "data": {
+                "curvyVaultFees": { "__typename": "CurvyVaultFees", "depositFee": "0", "withdrawalFee": "0" },
+                "curvyAggregatorFees": {
+                    "__typename": "CurvyAggregatorFees",
+                    "protocolFeePerThousand": "0",
+                    "commitmentFeeRoot": "0x01",
+                    "feeNotePublicKey": ["1", "2"],
+                },
+                "curvyVaultTokenCount": { "__typename": "CurvyVaultTokenCount", "count": tokens.to_string() },
+            }}),
+        )
+    }
+
+    fn chain_info_response(head: u64) -> (u16, serde_json::Value) {
+        (
+            200,
+            serde_json::json!({"data":{"chainInfo":{
+                "__typename":"ChainInfo","blockNumber":head,"chainId":100,"network":"gnosis","finality":2
+            }}}),
+        )
+    }
+
+    /// Blokli as a shield's lookup reads it: one registered token whose commitment fee can change,
+    /// an index head with the pending notes it holds, and the note ids the aggregator knows.
+    struct ShieldChain {
+        token: String,
+        commitment_fee: parking_lot::Mutex<u128>,
+        head: parking_lot::Mutex<u64>,
+        known: parking_lot::Mutex<Vec<String>>,
+        pending: parking_lot::Mutex<Vec<serde_json::Value>>,
+        searched_from: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl ShieldChain {
+        fn new(token: u64, commitment_fee: u128, head: u64) -> Arc<Self> {
+            Arc::new(Self {
+                token: token.to_string(),
+                commitment_fee: parking_lot::Mutex::new(commitment_fee),
+                head: parking_lot::Mutex::new(head),
+                known: Default::default(),
+                pending: Default::default(),
+                searched_from: Default::default(),
+            })
+        }
+
+        /// The aggregator holds `note`, committed.
+        fn know(&self, note: &OwnedNote) {
+            self.known.lock().push(note_id(note));
+        }
+
+        /// The index holds `note`'s `PendingNotes` item, from `block`.
+        fn index(&self, note: &OwnedNote, block: u64) {
+            self.pending.lock().push(serde_json::json!({
+                "noteId": note_id(note),
+                "ephemeralKey": [fr_to_dec(&note.ephemeral_key.0), fr_to_dec(&note.ephemeral_key.1)],
+                "viewTag": note.view_tag,
+                "tokenId": fr_to_dec(&note.token),
+                "amount": fr_to_dec(&note.amount),
+                "isPlaintext": true,
+                "position": {
+                    "block": block, "transactionIndex": 0, "logIndex": 0, "eventItemIndex": 0,
+                    "transactionHash": format!("0x{block:064x}"),
+                },
+            }));
+        }
+
+        async fn serve(self: &Arc<Self>) -> relayer::http_tests::Server {
+            let chain = Arc::clone(self);
+            relayer::http_tests::Server::new(move |path, body| chain.respond(path, &body)).await
+        }
+
+        fn respond(&self, path: &str, body: &serde_json::Value) -> Option<(u16, serde_json::Value)> {
+            assert_eq!(path, "/graphql");
+            let query = body["query"].as_str().unwrap();
+            let variables = &body["variables"];
+            if query.contains("curvyVaultFees") {
+                return Some(shield_fees_response(1));
+            }
+            if query.contains("curvyVaultToken") {
+                return Some((
+                    200,
+                    serde_json::json!({"data":{"curvyVaultToken":{
+                        "__typename":"CurvyVaultToken",
+                        "tokenAddress": format!("0x{}", "03".repeat(20)),
+                        "gasFees":{
+                            "tokenId": self.token,
+                            "portalDeployment": "0",
+                            "pendingNoteCommitment": self.commitment_fee.lock().to_string(),
+                            "withdrawal": "0",
+                        }
+                    }}}),
+                ));
+            }
+            if query.contains("chainInfo") {
+                return Some(chain_info_response(*self.head.lock()));
+            }
+            if query.contains("curvyPendingNotes") {
+                let from = variables["fromBlock"].as_str().unwrap().to_owned();
+                let start: u64 = from.parse().unwrap();
+                self.searched_from.lock().push(from);
+                let notes = self
+                    .pending
+                    .lock()
+                    .iter()
+                    .filter(|row| row["position"]["block"].as_u64().unwrap() >= start)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                return Some((
+                    200,
+                    serde_json::json!({"data":{"curvyPendingNotes":{"__typename":"CurvyPendingNotes","notes":notes}}}),
+                ));
+            }
+            if query.contains("curvyNoteStatus") {
+                let id = variables["noteId"].as_str().unwrap().to_ascii_lowercase();
+                return Some(note_status_response(self.known.lock().contains(&id)));
+            }
+            panic!("unexpected query {query}")
+        }
+    }
+
+    /// Journals a direct shield of `note` through JSON with `fields` added, so that a field left
+    /// out reads as it does in a journal written without it.
+    fn journal_direct_shield_with(
+        state: &RedbCurvyDepositState,
+        note: &OwnedNote,
+        fields: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let store = RedbCurvySdkStore::new(state)?;
+        let mut persisted = store.load()?;
+        let mut journal = serde_json::json!({ "note": StoredNote::from(note) });
+        for (key, value) in fields.as_object().expect("journal fields are an object") {
+            journal[key] = value.clone();
+        }
+        persisted.direct_shield_in_flight = Some(serde_json::from_value(journal)?);
+        store.save(&persisted)?;
+        Ok(())
+    }
+
+    /// A shielder that confirms every submission and counts them.
+    fn counting_shielder() -> (DirectShielder, Arc<std::sync::atomic::AtomicUsize>) {
+        let submissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shielder: DirectShielder = {
+            let submissions = submissions.clone();
+            Arc::new(move |_, _, _| {
+                submissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(confirmed_shield()) })
+            })
+        };
+        (shielder, submissions)
+    }
+
+    /// The vault's commitment fee rose between preparing the note and executing the shield, so
+    /// the vault committed the note at a smaller net amount, under another id. A confirmed shield
+    /// past its grace is sent again only when no version of its note landed: this one is recorded
+    /// at its landed amount, and the Safe sends nothing.
+    #[tokio::test]
+    async fn a_confirmed_shield_that_landed_under_new_fees_is_recorded_not_sent_again() -> anyhow::Result<()> {
+        let state = RedbCurvyDepositState::in_memory()?;
+        let journalled = OwnedNote {
+            amount: Fr::from(990_u64),
+            ..Adapter::owned_note(&fixture(7))?
+        };
+        let landed = OwnedNote {
+            amount: Fr::from(987_u64),
+            ..journalled.clone()
+        };
+        let submitted = ShieldSubmission::Submitted {
+            tx: confirmed_shield().tx,
+            at: Some(0),
+        };
+        journal_direct_shield_with(
+            &state,
+            &journalled,
+            serde_json::json!({ "gross": "1000", "submission": submitted, "from_block": 40 }),
+        )?;
+        // The fee the shield paid is still the one in force.
+        let chain = ShieldChain::new(1, 13, 60);
+        chain.know(&landed);
+        let server = chain.serve().await;
+        let (shielder, submissions) = counting_shielder();
+        let adapter = test_adapter_with_shielder(&state, server.url.clone(), Some(shielder))?;
+
+        adapter
+            .fund(
+                HoprBalance::from(U256::from(1_000_u32)),
+                Address::from([9_u8; 20]),
+                ShieldResend::AfterGrace,
+            )
+            .await?;
+        let stored = adapter.store.load()?;
+        assert_eq!(stored.funding, vec![StoredNote::from(&landed)]);
+        assert!(stored.pending.is_empty(), "the landed note is already committed");
+        assert!(stored.direct_shield_in_flight.is_none(), "the journal is settled");
+        assert_eq!(
+            submissions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the float is not sent a second time"
+        );
+        Ok(())
+    }
+
+    /// A journal with no submission record and no starting block, whose shield landed under fees
+    /// that have changed again since: neither the journalled amount nor today's fees
+    /// give the landed note, the index's `PendingNotes` does, searched from genesis.
+    #[tokio::test]
+    async fn a_legacy_journal_finds_a_shield_that_landed_under_since_replaced_fees() -> anyhow::Result<()> {
+        let state = RedbCurvyDepositState::in_memory()?;
+        let journalled = OwnedNote {
+            amount: Fr::from(990_u64),
+            ..Adapter::owned_note(&fixture(7))?
+        };
+        let landed = OwnedNote {
+            amount: Fr::from(987_u64),
+            ..journalled.clone()
+        };
+        journal_direct_shield_with(&state, &journalled, serde_json::json!({ "gross": "1000" }))?;
+        let chain = ShieldChain::new(1, 20, 60);
+        chain.know(&landed);
+        chain.index(&landed, 50);
+        let server = chain.serve().await;
+        let (shielder, submissions) = counting_shielder();
+        let adapter = test_adapter_with_shielder(&state, server.url.clone(), Some(shielder))?;
+
+        adapter
+            .fund(
+                HoprBalance::from(U256::from(1_000_u32)),
+                Address::from([9_u8; 20]),
+                ShieldResend::AfterGrace,
+            )
+            .await?;
+        let stored = adapter.store.load()?;
+        assert_eq!(stored.funding, vec![StoredNote::from(&landed)]);
+        assert!(stored.direct_shield_in_flight.is_none());
+        assert_eq!(submissions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            *chain.searched_from.lock(),
+            ["0"],
+            "a legacy journal searches from genesis"
+        );
+        Ok(())
+    }
+
+    /// A new shield end to end, with the fee rising while the Safe's call is in flight: the
+    /// journal records where to search from, and what gets recorded is the note the vault
+    /// committed.
+    #[tokio::test]
+    async fn a_new_shield_records_the_note_the_vault_committed() -> anyhow::Result<()> {
+        const GROSS: u128 = 1_000_000;
+        const PREPARED_FEE: u128 = 1_000;
+        const LANDED_FEE: u128 = 1_337;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let chain = ShieldChain::new(4, PREPARED_FEE, 77);
+        let server = chain.serve().await;
+        let journal = Arc::new(RedbCurvySdkStore::new(&state)?);
+        let submissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shielder: DirectShielder = {
+            let chain = Arc::clone(&chain);
+            let journal = Arc::clone(&journal);
+            let submissions = submissions.clone();
+            Arc::new(move |_, _, gross| {
+                let chain = Arc::clone(&chain);
+                let journal = Arc::clone(&journal);
+                let submissions = submissions.clone();
+                Box::pin(async move {
+                    let shield = journal
+                        .load()
+                        .map_err(|error| ShieldFailure::NotSubmitted(error.to_string()))?
+                        .direct_shield_in_flight
+                        .expect("journalled before the Safe is asked");
+                    assert_eq!(shield.from_block, Some(77), "the index head when journalled");
+                    // The fee rises, and the shield executes under it.
+                    *chain.commitment_fee.lock() = LANDED_FEE;
+                    let prepared = OwnedNote::try_from(&shield.note)
+                        .map_err(|error| ShieldFailure::NotSubmitted(error.to_string()))?;
+                    chain.know(&OwnedNote {
+                        amount: Fr::from(gross - LANDED_FEE),
+                        ..prepared
+                    });
+                    *chain.head.lock() = 78;
+                    submissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(confirmed_shield())
+                })
+            })
+        };
+        let adapter = test_adapter_with_shielder(&state, server.url.clone(), Some(shielder))?;
+
+        adapter
+            .fund(
+                HoprBalance::from(U256::from(GROSS)),
+                Address::from([9_u8; 20]),
+                ShieldResend::AfterGrace,
+            )
+            .await?;
+        let stored = adapter.store.load()?;
+        assert_eq!(stored.funding.len(), 1);
+        let funded = OwnedNote::try_from(&stored.funding[0])?;
+        assert_eq!(
+            funded.amount,
+            Fr::from(GROSS - LANDED_FEE),
+            "the vault's net, not the prepared one"
+        );
+        assert!(stored.direct_shield_in_flight.is_none());
+        assert_eq!(submissions.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            chain.searched_from.lock().iter().all(|from| from == "77"),
+            "searched from the journalled block: {:?}",
+            chain.searched_from.lock()
         );
         Ok(())
     }
